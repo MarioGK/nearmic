@@ -96,6 +96,36 @@ zig build -Dtarget=aarch64-linux-gnu -Dcpu=cortex_a53 \
 The binary is glibc (not musl): a static musl binary cannot `dlopen` Debian's
 glibc PipeWire library.
 
+## Measured alternatives (hushmic/DPDFNet, LocalVQE)
+
+Both were built and run on the operator's own Maono recording before choosing
+to keep RNNoise.
+
+**hushmic / DPDFNet** (ONNX Runtime 1.27, `dpdfnet8_48khz_hr` and
+`dpdfnet2_48khz_hr`, x86-64 workstation with AVX2, single-threaded):
+
+| Model | 6.0 s of audio | realtime factor | Latency |
+| --- | ---: | ---: | ---: |
+| dpdfnet8 (quality) | 2.39 s | 2.5x | 80 ms |
+| dpdfnet2 (light) | 0.86 s | 7.0x | 80 ms |
+
+DPDFNet removes essentially all of the room tone on that clip (mean -91 dBFS
+against -44 dBFS in), but it costs 50 ms more look-ahead than the current
+chain. The RK3399 has no AVX2/FMA, so ONNX Runtime falls back to NEON: expect
+roughly 4-6x the desktop cost per core, which puts dpdfnet8 below realtime and
+dpdfnet2 at 1-2x. Porting also means shipping ONNX Runtime aarch64 plus the
+STFT/mask streaming layer.
+
+**LocalVQE** is 16 kHz only (8 kHz of bandwidth) and every joint model needs a
+far-end reference for AEC. v1.2 (1.3 M) runs 3.7x realtime on a Zen4 core,
+which maps to well under 1x on a Cortex-A72; the compact GTCRN line (~49 K) is
+fast enough (~8x on an A72) but is still 16 kHz. On a full-band 48 kHz
+microphone it would sound duller than RNNoise regardless of noise suppression.
+
+Conclusion: 48 kHz RNNoise plus the post chain above is the best quality that
+runs in realtime on this board. The "sounds far away" complaint was a level and
+EQ problem, not a model problem.
+
 ## Limits
 
 - **DPDFNet** would be the strongest quality option, but the native runtime is

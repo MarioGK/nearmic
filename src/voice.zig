@@ -53,6 +53,11 @@ pub const Post = struct {
         }
         if (self.level) self.leveler.process(samples);
         self.limiter.process(samples);
+        // Safety clamp: the look-ahead limiter should already hold the peak at
+        // `ceiling`, and this makes a single overshoot impossible (it only
+        // touches samples above -2 dBFS, so it is inaudible).
+        const c = self.limiter.ceiling;
+        for (samples) |*s| s.* = std.math.clamp(s.*, -c, c);
     }
 };
 
