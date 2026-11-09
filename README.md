@@ -2,9 +2,11 @@
 
 A Linux virtual microphone for a voice that is too far from the mic. NearMic is one executable. It reads the microphone you choose, makes the voice louder and steadier, lowers stationary noise, and publishes a PipeWire source named **NearMic**. Discord, OBS, and the browser can select that source.
 
-The processing that ships was chosen by a bake-off on a shared far-mic fixture, not by habit. The winner is the Zig chain called `dsp`: an 80 Hz high-pass, a causal spectral denoiser, a 3.5 kHz presence shelf, a speech-gated leveler aimed at about -18 dBFS, and a soft limiter. On the machine that ran the bake-off it used well under 1% of the whole CPU while keeping up with 48 kHz, and each 5.3 ms block finished in a few hundredths of a millisecond. Numbers are in [bench/RESULTS.md](bench/RESULTS.md).
+The processing that ships is the only chain that passed the bake-off gates on the shared fixture. It is `dsp-dereverb`: an 80 Hz high-pass, a causal spectral denoiser, a delayed spectral dereverb, a 3.5 kHz presence shelf, a speech-gated leveler aimed at -18 dBFS, and a soft limiter. The leveler reads the signal after the denoiser, so it makes up the gain the denoiser removes.
 
-A heavier dereverb stage shortened the room tail a bit more and also pulled speech level down, so it did not pass. SpeexDSP's denoise and dereverb stayed fast and did not keep pauses quiet. RNNoise, LocalVQE, DPDFNet, and ClearerVoice are discussed in [bench/EXTERNAL.md](bench/EXTERNAL.md). They are not inside the binary.
+On the 4-core Xeon that ran the bake-off, that chain used 0.0003 of the machine and the 99th percentile 5.333 ms block took 0.009 ms, 578 times faster than realtime. Speech entered at -28.9 dBFS and left at -20.3 dBFS. Pauses moved from -42.1 dBFS to -41.0 dBFS. The impulse tail ratio fell from 0.333 to 0.072. The same chain without the dereverb raised pauses by 6.2 dB and failed that gate. The leveler alone and SpeexDSP left the tail at 0.333 and 0.327. The fixture is synthetic. It is not a recording of a Comica VM40. The table is [bench/RESULTS.md](bench/RESULTS.md).
+
+RNNoise, LocalVQE, DPDFNet, and ClearerVoice are discussed in [bench/EXTERNAL.md](bench/EXTERNAL.md). They are not inside the binary. `zig build bakeoff` exits with an error if the engine in the binary is not the measured winner.
 
 ## Run
 

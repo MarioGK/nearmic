@@ -109,10 +109,10 @@ pub const Agc = struct {
         return 1 - @exp(-(@as(f32, hop) / sample_rate) / seconds);
     }
 
-    pub fn process(self: *Agc, input_rms: f32, samples: []f32) void {
-        const speech = input_rms >= self.speech_rms;
+    pub fn process(self: *Agc, presence_rms: f32, level_rms: f32, samples: []f32) void {
+        const speech = presence_rms >= self.speech_rms;
         if (speech) {
-            var desired = if (input_rms > 1e-8) self.target / input_rms else self.max_gain;
+            var desired = if (level_rms > 1e-8) self.target / level_rms else self.max_gain;
             if (desired > self.max_gain) desired = self.max_gain;
             if (desired < 0.25) desired = 0.25;
             const c = if (desired < self.makeup) self.attack else self.release;
@@ -125,6 +125,86 @@ pub const Agc = struct {
         for (samples) |*s| s.* *= g;
     }
 };
+
+const Fft512 = struct {
+    rev: [fft_size]u16,
+    wr: [fft_size / 2]f32,
+    wi: [fft_size / 2]f32,
+
+    fn init() Fft512 {
+        var plan: Fft512 = undefined;
+        for (0..fft_size) |i| {
+            var x = i;
+            var r: usize = 0;
+            var bit: usize = 0;
+            while (bit < 9) : (bit += 1) {
+                r = (r << 1) | (x & 1);
+                x >>= 1;
+            }
+            plan.rev[i] = @intCast(r);
+        }
+        for (0..fft_size / 2) |k| {
+            const ang = -2 * std.math.pi * @as(f32, @floatFromInt(k)) / @as(f32, fft_size);
+            plan.wr[k] = @cos(ang);
+            plan.wi[k] = @sin(ang);
+        }
+        return plan;
+    }
+
+    fn run(self: Fft512, real: []f32, imag: []f32, inverse: bool) void {
+        const n = fft_size;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const j: usize = self.rev[i];
+            if (i < j) {
+                std.mem.swap(f32, &real[i], &real[j]);
+                std.mem.swap(f32, &imag[i], &imag[j]);
+            }
+        }
+        var len: usize = 2;
+        while (len <= n) : (len <<= 1) {
+            const step = n / len;
+            var start: usize = 0;
+            while (start < n) : (start += len) {
+                var k: usize = 0;
+                var tw: usize = 0;
+                while (k < len / 2) : ({
+                    k += 1;
+                    tw += step;
+                }) {
+                    const wr = self.wr[tw];
+                    const wi = if (inverse) -self.wi[tw] else self.wi[tw];
+                    const a = start + k;
+                    const b = a + len / 2;
+                    const tr = wr * real[b] - wi * imag[b];
+                    const ti = wr * imag[b] + wi * real[b];
+                    real[b] = real[a] - tr;
+                    imag[b] = imag[a] - ti;
+                    real[a] += tr;
+                    imag[a] += ti;
+                }
+            }
+        }
+        if (inverse) {
+            const inv = 1 / @as(f32, n);
+            for (real, imag) |*r, *im| {
+                r.* *= inv;
+                im.* *= inv;
+            }
+        }
+    }
+};
+
+var fft512_plan: Fft512 = undefined;
+var fft512_ready: bool = false;
+
+fn fft512() *Fft512 {
+    if (!fft512_ready) {
+        fft512_plan = Fft512.init();
+        fft512_ready = true;
+    }
+    return &fft512_plan;
+}
 
 fn fftRadix2(real: []f32, imag: []f32, inverse: bool) void {
     const n = real.len;
@@ -206,7 +286,7 @@ pub const Spectral = struct {
         @memcpy(real[hop..], input);
         @memcpy(&self.hist, input);
         for (0..fft_size) |i| real[i] *= self.window[i];
-        fftRadix2(&real, &imag, false);
+        fft512().run(&real, &imag, false);
 
         var mag: [bins]f32 = undefined;
         for (0..bins) |k| mag[k] = @sqrt(real[k] * real[k] + imag[k] * imag[k]) + 1e-12;
@@ -263,7 +343,7 @@ pub const Spectral = struct {
             }
         }
 
-        fftRadix2(&real, &imag, true);
+        fft512().run(&real, &imag, true);
         for (0..fft_size) |i| self.ola[i] += real[i] * self.window[i];
         @memcpy(output, self.ola[0..hop]);
         var shift: [fft_size]f32 = .{0} ** fft_size;
@@ -321,12 +401,12 @@ pub const Chain = struct {
 
     fn processHop(self: *Chain, input: []const f32, output: []f32, level: bool) void {
         var frame: [hop]f32 = undefined;
-        var sum_sq: f32 = 0;
+        var presence_sq: f32 = 0;
         for (input, 0..) |x, i| {
             frame[i] = self.highpass.process(x);
-            sum_sq += frame[i] * frame[i];
+            presence_sq += frame[i] * frame[i];
         }
-        const frame_rms = @sqrt(sum_sq / @as(f32, hop));
+        const presence_rms = @sqrt(presence_sq / @as(f32, hop));
         if (self.use_spectral) {
             self.spectral.processHop(&frame, output);
         } else {
@@ -334,7 +414,10 @@ pub const Chain = struct {
         }
         for (output) |*s| s.* = self.shelf.process(s.*);
         if (level) {
-            self.agc.process(frame_rms, output);
+            var level_sq: f32 = 0;
+            for (output) |s| level_sq += s * s;
+            const level_rms = @sqrt(level_sq / @as(f32, hop));
+            self.agc.process(presence_rms, level_rms, output);
             for (output) |*s| s.* = self.limiter.process(s.*);
         }
     }
@@ -419,6 +502,45 @@ fn sine(freq: f32, n: usize, amp: f32, out: []f32) void {
     }
 }
 
+test "fft512 roundtrip" {
+    var real = [_]f32{0} ** fft_size;
+    var imag = [_]f32{0} ** fft_size;
+    real[0] = 1;
+    real[3] = -0.25;
+    real[40] = 0.5;
+    const orig = real;
+    fft512().run(&real, &imag, false);
+    fft512().run(&real, &imag, true);
+    for (orig, real) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-4);
+    for (imag) |im| try std.testing.expect(@abs(im) < 1e-4);
+}
+
+test "bursty voice stays near the target after denoise" {
+    var chain = Chain.init(true, false);
+    const n: usize = hop * 400;
+    const input = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(input);
+    const output = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(output);
+    var rng = std.Random.DefaultPrng.init(11);
+    const rand = rng.random();
+    for (input, 0..) |*s, t| {
+        s.* = (rand.float(f32) * 2 - 1) * 0.004;
+        const sec = @as(f32, @floatFromInt(t)) / sample_rate;
+        if (sec < 0.4) continue;
+        const cycle = (sec - 0.4) / 0.32;
+        const frac = cycle - @floor(cycle);
+        if (frac < 0.62) {
+            const env = @sin(std.math.pi * frac / 0.62);
+            s.* += env * 0.05 * @sin(2 * std.math.pi * 180 * @as(f32, @floatFromInt(t)) / sample_rate);
+            s.* += env * 0.02 * @sin(2 * std.math.pi * 360 * @as(f32, @floatFromInt(t)) / sample_rate);
+        }
+    }
+    chain.process(input, output);
+    const speech = rmsDb(output[n / 2 .. n * 3 / 4]);
+    try std.testing.expect(speech > -26 and speech < -12);
+}
+
 test "fft roundtrip" {
     var real = [_]f32{0} ** 8;
     var imag = [_]f32{0} ** 8;
@@ -474,7 +596,7 @@ test "agc does not wind up on silence" {
     var agc = Agc.init();
     var frame = [_]f32{0} ** hop;
     var i: usize = 0;
-    while (i < 200) : (i += 1) agc.process(0, &frame);
+    while (i < 200) : (i += 1) agc.process(0, 0, &frame);
     try std.testing.expect(agc.makeup < 1.05);
     try std.testing.expect(rms(&frame) < 1e-4);
 }

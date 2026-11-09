@@ -46,12 +46,17 @@ pub fn main() !void {
     if (std.mem.eql(u8, args[1], "bench") or std.mem.eql(u8, args[1], "bakeoff")) {
         var body = std.ArrayList(u8).init(allocator);
         defer body.deinit();
-        _ = try bench.run(allocator, body.writer());
+        const winner = try bench.run(allocator, body.writer());
         const stdout = std.io.getStdOut();
         try stdout.writeAll(body.items);
         if (args.len == 4 and std.mem.eql(u8, args[2], "--write")) {
             if (std.fs.path.dirname(args[3])) |dir| try std.fs.cwd().makePath(dir);
             try std.fs.cwd().writeFile(.{ .sub_path = args[3], .data = body.items });
+        }
+        if (!std.mem.eql(u8, winner, app.engineName())) {
+            const shown = if (winner.len == 0) "none" else winner;
+            std.debug.print("measured winner is {s}; this binary ships {s}\n", .{ shown, app.engineName() });
+            std.process.exit(1);
         }
         return;
     }

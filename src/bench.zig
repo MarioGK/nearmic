@@ -23,6 +23,7 @@ const Row = struct {
     block_ms: f64,
     delay_ms: f64,
     speech_db: f32,
+    speech_in_db: f32,
     loud_err: f32,
     pause_in_db: f32,
     pause_out_db: f32,
@@ -94,6 +95,24 @@ pub fn makeImpulse(allocator: std.mem.Allocator) ![]f32 {
     return samples;
 }
 
+var model_buf: [128]u8 = undefined;
+
+fn cpuModel() []const u8 {
+    const text = std.fs.cwd().readFileAlloc(std.heap.page_allocator, "/proc/cpuinfo", 1 << 16) catch return "unknown";
+    defer std.heap.page_allocator.free(text);
+    const key = "model name";
+    const at = std.mem.indexOf(u8, text, key) orelse return "unknown";
+    const rest = text[at + key.len ..];
+    const colon = std.mem.indexOfScalar(u8, rest, ':') orelse return "unknown";
+    const line = rest[colon + 1 ..];
+    const end = std.mem.indexOfScalar(u8, line, '\n') orelse line.len;
+    const name = std.mem.trim(u8, line[0..end], " \t");
+    if (name.len == 0) return "unknown";
+    const n = @min(name.len, model_buf.len);
+    @memcpy(model_buf[0..n], name[0..n]);
+    return model_buf[0..n];
+}
+
 fn procCpuSeconds() !f64 {
     const text = try std.fs.cwd().readFileAlloc(std.heap.page_allocator, "/proc/self/stat", 1 << 16);
     defer std.heap.page_allocator.free(text);
@@ -122,16 +141,23 @@ fn percentile(times: []u64, p: f64) u64 {
     return times[idx];
 }
 
-fn maskedRms(samples: []const f32, mask: []const u8, want: u8, skip: usize) f32 {
+fn maskedRms(samples: []const f32, mask: []const u8, want: u8, skip: usize, delay: usize) f32 {
     var acc: f32 = 0;
     var n: usize = 0;
-    for (samples, mask, 0..) |s, m, i| {
-        if (i < skip or m != want) continue;
+    for (samples, 0..) |s, i| {
+        if (i < skip + delay or i < delay) continue;
+        const src = i - delay;
+        if (src >= mask.len or mask[src] != want) continue;
         acc += s * s;
         n += 1;
     }
     if (n == 0) return 0;
     return @sqrt(acc / @as(f32, @floatFromInt(n)));
+}
+
+fn dbOf(lin: f32) f32 {
+    if (lin < 1e-10) return -120;
+    return 20 * std.math.log10(lin);
 }
 
 fn tailRatio(samples: []const f32, delay: usize) f32 {
@@ -240,12 +266,15 @@ fn measure(allocator: std.mem.Allocator, engine: *Engine, far: Fixture, impulse:
     const cores: f64 = @floatFromInt(try std.Thread.getCpuCount());
     const cpu = (cpu1 - cpu0) / audio_seconds / cores;
 
-    const speech = maskedRms(output, far.speech, 1, 48000 / 2);
-    const pause = maskedRms(output, far.speech, 0, 48000 / 2);
-    const pause_in = maskedRms(far.samples, far.speech, 0, 48000 / 2);
-    const speech_db: f32 = if (speech < 1e-10) -120 else 20 * std.math.log10(speech);
-    const pause_out_db: f32 = if (pause < 1e-10) -120 else 20 * std.math.log10(pause);
-    const pause_in_db: f32 = if (pause_in < 1e-10) -120 else 20 * std.math.log10(pause_in);
+    const skip: usize = 48000 / 2;
+    const speech = maskedRms(output, far.speech, 1, skip, engine.delay);
+    const pause = maskedRms(output, far.speech, 0, skip, engine.delay);
+    const speech_in = maskedRms(far.samples, far.speech, 1, skip, 0);
+    const pause_in = maskedRms(far.samples, far.speech, 0, skip, 0);
+    const speech_db = dbOf(speech);
+    const speech_in_db = dbOf(speech_in);
+    const pause_out_db = dbOf(pause);
+    const pause_in_db = dbOf(pause_in);
 
     const p99 = percentile(times.items, 0.99);
     const p99_ms = @as(f64, @floatFromInt(p99)) / 1e6;
@@ -264,6 +293,7 @@ fn measure(allocator: std.mem.Allocator, engine: *Engine, far: Fixture, impulse:
         .block_ms = block_ms,
         .delay_ms = delay_ms,
         .speech_db = speech_db,
+        .speech_in_db = speech_in_db,
         .loud_err = loud_err,
         .pause_in_db = pause_in_db,
         .pause_out_db = pause_out_db,
@@ -336,40 +366,56 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype) ![]const u8 {
         try rows.append(try measure(allocator, engine, far, impulse, raw_tail));
     }
 
+    var passers: usize = 0;
     var best_tail: f32 = 10;
     var best_pause_drop: f32 = -100;
     for (rows.items) |row| {
         if (!row.pass) continue;
+        passers += 1;
         if (row.tail_ratio < best_tail) best_tail = row.tail_ratio;
         const drop = row.pause_in_db - row.pause_out_db;
         if (drop > best_pause_drop) best_pause_drop = drop;
     }
-    const room_matters = best_tail < raw_tail * 0.90;
-    var winner: []const u8 = "dsp";
+    const room_matters = passers > 0 and best_tail < raw_tail * 0.90;
+    var winner: []const u8 = "";
     var winner_cpu: f64 = 10;
+    var winner_tail: f32 = 10;
+    var winner_loud: f32 = 100;
     for (rows.items) |row| {
         if (!row.pass) continue;
         const room_close = !room_matters or row.tail_ratio <= best_tail * 1.15;
         const noise_close = row.pause_in_db - row.pause_out_db >= best_pause_drop - 3;
-        if (room_close and noise_close and row.cpu < winner_cpu) {
+        if (!room_close or !noise_close) continue;
+        const cpu_tie = winner.len != 0 and @abs(row.cpu - winner_cpu) <= @max(winner_cpu * 0.10, 0.0002);
+        const better = winner.len == 0 or (!cpu_tie and row.cpu < winner_cpu) or (cpu_tie and row.tail_ratio < winner_tail - 0.005) or (cpu_tie and @abs(row.tail_ratio - winner_tail) <= 0.005 and row.loud_err < winner_loud);
+        if (better) {
             winner = row.name;
             winner_cpu = row.cpu;
+            winner_tail = row.tail_ratio;
+            winner_loud = row.loud_err;
         }
     }
 
+    const model = cpuModel();
+    const cores = try std.Thread.getCpuCount();
     try writer.print("# Bake-off\n\n", .{});
-    try writer.print("Same 4 second far-mic fixture on this machine. CPU is the share of the whole machine needed to keep up with 48 kHz audio. A row passes when the 99th percentile block is faster than realtime, that share stays at or under 5%, speech lands within 8 dB of -18 dBFS, and pauses do not rise more than 6 dB.\n\n", .{});
+    try writer.print("Machine: {s}, {d} cores. CPU is process time divided by audio duration divided by core count, so 0.05 is 5% of the whole machine while keeping up with 48 kHz.\n\n", .{ model, cores });
+    try writer.print("Fixture: 4.0 seconds at 48 kHz. Stationary noise at amplitude 0.004, five harmonics in 170 ms bursts, then three echoes at 25 ms, 54 ms, and 100 ms. This is synthetic. It is not a recording of a Comica VM40.\n\n", .{});
+    try writer.print("A row passes only when every gate holds: p99 block time is under the block duration, CPU is at or under 0.05, speech RMS is above -36 dBFS, speech RMS is within 8 dB of -18 dBFS, and pause RMS does not rise more than 6 dB.\n\n", .{});
     try writer.print("Raw impulse tail ratio: {d:.3}\n\n", .{raw_tail});
-    try writer.print("| engine | pass | cpu | p99 ms | block ms | delay ms | speech dBFS | loudness error | pause in | pause out | tail ratio |\n", .{});
-    try writer.print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n", .{});
+    try writer.print("| engine | pass | cpu | x realtime | p99 ms | block ms | delay ms | speech in | speech out | loudness error | pause in | pause out | tail ratio |\n", .{});
+    try writer.print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n", .{});
     for (rows.items) |row| {
-        try writer.print("| {s} | {s} | {d:.4} | {d:.3} | {d:.3} | {d:.2} | {d:.1} | {d:.1} | {d:.1} | {d:.1} | {d:.3} |\n", .{
+        const times = if (row.p99_ms > 0) row.block_ms / row.p99_ms else 0;
+        try writer.print("| {s} | {s} | {d:.4} | {d:.0} | {d:.3} | {d:.3} | {d:.2} | {d:.1} | {d:.1} | {d:.1} | {d:.1} | {d:.1} | {d:.3} |\n", .{
             row.name,
             if (row.pass) "yes" else "no",
             row.cpu,
+            times,
             row.p99_ms,
             row.block_ms,
             row.delay_ms,
+            row.speech_in_db,
             row.speech_db,
             row.loud_err,
             row.pause_in_db,
@@ -377,11 +423,21 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype) ![]const u8 {
             row.tail_ratio,
         });
     }
-    try writer.print("\nWinner: **{s}**\n\n", .{winner});
-    try writer.print("The best passing tail ratio is {s} 90 percent of the raw impulse, so the room score {s}. The winner is the lightest passer near the best tail and the best pause drop.\n", .{
-        if (room_matters) "under" else "not under",
-        if (room_matters) "counts" else "does not decide the pick",
-    });
+    if (winner.len == 0) {
+        try writer.print("\nWinner: **none**. No row passed every gate.\n\n", .{});
+    } else {
+        try writer.print("\nWinner: **{s}**\n\n", .{winner});
+    }
+    if (passers == 0) {
+        try writer.print("No passing tail was measured, so the room score did not pick an engine.\n", .{});
+    } else {
+        try writer.print("Best passing tail ratio {d:.3} against raw {d:.3}. The room score {s}, because that tail {s} under 90% of raw. Among passers that stay within 15% of that tail and within 3 dB of the best pause drop, the lowest CPU wins. A CPU gap under 10% (or 0.0002) is a tie, broken by the lower tail ratio and then the smaller loudness error.\n", .{
+            best_tail,
+            raw_tail,
+            if (room_matters) "counts" else "does not decide the pick",
+            if (room_matters) "is" else "is not",
+        });
+    }
     try writer.print("\n## Not in this binary\n\n", .{});
     try writer.print("- RNNoise current weights are a generated 78 MB C file downloaded at build time. It was left out of the single binary so the release stays one small file. The classical denoise above is the lightweight stand-in.\n", .{});
     try writer.print("- LocalVQE, DPDFNet, and ClearerVoice are reference designs. ClearerVoice's published models decode in 1 to 10 second windows and want CUDA, so they miss the live gates without a separate measurement. LocalVQE and DPDFNet are not linked here; see bench/EXTERNAL.md for the build attempt.\n", .{});

@@ -1,6 +1,6 @@
 # Candidates outside the shipped binary
 
-The live bake-off in [RESULTS.md](RESULTS.md) measured four engines on one fixture: a leveler, the Zig spectral denoiser plus leveler (`dsp`), the same chain with a delayed spectral dereverb, and SpeexDSP denoise plus dereverb followed by the Zig leveler. `dsp` is the one that passed and shipped.
+The live bake-off in [RESULTS.md](RESULTS.md) measured four engines on one synthetic fixture: a leveler, the Zig spectral denoiser plus leveler (`dsp`), the same chain with a delayed spectral dereverb (`dsp-dereverb`), and SpeexDSP denoise plus dereverb followed by the Zig leveler. `dsp-dereverb` is the only row that passed every gate, and it is the engine in the binary.
 
 These others were part of the design review and were not given a row in that table.
 
@@ -10,7 +10,7 @@ The current Xiph tree downloads its weights as a generated C file of about 78 MB
 
 ## LocalVQE
 
-[LocalVQE](https://github.com/localai-org/LocalVQE) v1.2 is the small causal model (1.3 M parameters, 16 kHz, 16 ms hops) that matches the "less distant" goal on paper. The repository and its GGML submodule were cloned here. Configure did not finish: `/usr/bin/c++` is Clang, and the unversioned `libstdc++` linker script lives in GCC's private directory (`/usr/lib/gcc/x86_64-linux-gnu/13/libstdc++.so`), which that driver does not search. LocalVQE is not linked into NearMic. Published numbers on a Ryzen 9 7900 put v1.2 near 4 ms per 16 ms hop on one thread, which would fit a 5% machine budget, and v1.3 is the one likely to miss it on a 5800X. Shipping it would also mean embedding GGML. The bake-off rule was to ship the lightest passer, and `dsp` already passed.
+[LocalVQE](https://github.com/localai-org/LocalVQE) v1.2 is the small causal model (1.3 M parameters, 16 kHz, 16 ms hops) that matches the "less distant" goal on paper. The repository and its GGML submodule were cloned here. Configure did not finish: `/usr/bin/c++` is Clang, and the unversioned `libstdc++` linker script lives in GCC's private directory (`/usr/lib/gcc/x86_64-linux-gnu/13/libstdc++.so`), which that driver does not search. LocalVQE is not linked into NearMic. Published numbers on a Ryzen 9 7900 put v1.2 near 4 ms per 16 ms hop on one thread, which would fit a 5% machine budget, and v1.3 is the one likely to miss it on a 5800X. Shipping it would also mean embedding GGML. The bake-off ships the lightest passer, and that passer is the Zig chain.
 
 ## DPDFNet
 

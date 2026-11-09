@@ -3,7 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const shipped = b.option([]const u8, "engine", "Shipped engine: dsp, dsp-dereverb, or leveler") orelse "dsp";
+    const shipped = b.option([]const u8, "engine", "Shipped engine: dsp, dsp-dereverb, or leveler") orelse "dsp-dereverb";
 
     const exe = addExe(b, target, optimize, "nearmic", shipped, false);
     b.installArtifact(exe);
