@@ -21,8 +21,9 @@ jobs:
       - name: Test
         run: zig build test
       - name: Release binary
-        run: zig build -Doptimize=ReleaseFast
-      - name: Dynamic libraries
-        run: sh scripts/check-ldd.sh zig-out/bin/nearmic
+        run: |
+          zig build -Doptimize=ReleaseFast
+          sh scripts/check-ldd.sh zig-out/bin/nearmic
+          ./zig-out/bin/nearmic qa
       - name: Bake-off
         run: zig build bakeoff -Doptimize=ReleaseFast

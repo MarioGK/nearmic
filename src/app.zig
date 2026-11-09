@@ -1,9 +1,12 @@
 const std = @import("std");
 const dsp = @import("dsp.zig");
 const wav = @import("wav.zig");
+const config = @import("config.zig");
+const engines = @import("engines.zig");
 const options = @import("build_options");
 
-pub const version = "0.1.0";
+pub const version = "0.2.0";
+pub const Mode = config.Mode;
 
 extern fn nm_pw_open(target: [*:0]const u8) c_int;
 extern fn nm_pw_close() void;
@@ -19,8 +22,6 @@ extern fn nm_underruns() u64;
 extern "c" fn dlopen(path: [*:0]const u8, flags: c_int) ?*anyopaque;
 extern "c" fn dlclose(handle: *anyopaque) c_int;
 
-pub const Mode = enum(u8) { suppress, bypass, mute };
-
 pub fn shippedChain() dsp.Chain {
     if (std.mem.eql(u8, options.shipped, "dsp-dereverb")) return dsp.Chain.init(true, true);
     if (std.mem.eql(u8, options.shipped, "leveler")) return dsp.Chain.init(false, false);
@@ -32,14 +33,23 @@ pub fn engineName() []const u8 {
 }
 
 const App = struct {
+    allocator: std.mem.Allocator,
     alive: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     mode: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(Mode.suppress)),
     listen: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    chain: dsp.Chain,
-    delay_buf: [8192]f32 = .{0} ** 8192,
+    mu: std.Thread.Mutex = .{},
+    slot: engines.Slot,
+    gain_db: f32 = 0,
+    delay_buf: [16384]f32 = .{0} ** 16384,
     delay_pos: usize = 0,
     source_name: [128]u8 = .{0} ** 128,
     source_len: usize = 0,
+    config_path: []u8,
+    config_mtime: i128 = 0,
+    noted_source: [128]u8 = .{0} ** 128,
+    noted_len: usize = 0,
+    failed_engine: [64]u8 = .{0} ** 64,
+    failed_len: usize = 0,
 };
 
 var global_app: ?*App = null;
@@ -53,58 +63,22 @@ pub fn socketPath(buf: []u8) ![]const u8 {
     return std.fmt.bufPrintZ(buf, "/tmp/nearmic-{d}.sock", .{uid});
 }
 
-fn configDir(allocator: std.mem.Allocator) ![]u8 {
-    const home = std.posix.getenv("HOME") orelse "/tmp";
-    return std.fmt.allocPrint(allocator, "{s}/.config/nearmic", .{home});
-}
-
-fn loadConfig(allocator: std.mem.Allocator, app: *App) !void {
-    const dir = try configDir(allocator);
-    defer allocator.free(dir);
-    const path = try std.fmt.allocPrint(allocator, "{s}/config", .{dir});
-    defer allocator.free(path);
-    const text = std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024) catch return;
-    defer allocator.free(text);
-    var it = std.mem.splitScalar(u8, text, '\n');
-    while (it.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \r\t");
-        if (line.len == 0 or line[0] == '#') continue;
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        const key = line[0..eq];
-        const value = line[eq + 1 ..];
-        if (std.mem.eql(u8, key, "source")) {
-            const n = @min(value.len, app.source_name.len - 1);
-            @memcpy(app.source_name[0..n], value[0..n]);
-            app.source_len = n;
-            app.source_name[n] = 0;
-        } else if (std.mem.eql(u8, key, "mode")) {
-            if (std.meta.stringToEnum(Mode, value)) |m| app.mode.store(@intFromEnum(m), .release);
-        } else if (std.mem.eql(u8, key, "listen")) {
-            app.listen.store(std.mem.eql(u8, value, "on"), .release);
-        }
-    }
-}
-
-fn saveMode(allocator: std.mem.Allocator, app: *App) void {
-    const dir = configDir(allocator) catch return;
-    defer allocator.free(dir);
-    std.fs.cwd().makePath(dir) catch return;
-    const path = std.fmt.allocPrint(allocator, "{s}/config", .{dir}) catch return;
-    defer allocator.free(path);
-    const mode = @as(Mode, @enumFromInt(app.mode.load(.acquire)));
-    const listen: []const u8 = if (app.listen.load(.acquire)) "on" else "off";
-    const source = app.source_name[0..app.source_len];
-    const body = std.fmt.allocPrint(allocator, "source={s}\nmode={s}\nlisten={s}\n", .{ source, @tagName(mode), listen }) catch return;
-    defer allocator.free(body);
-    std.fs.cwd().writeFile(.{ .sub_path = path, .data = body }) catch return;
+fn copyName(dst: []u8, src: []const u8) usize {
+    const n = @min(src.len, dst.len);
+    @memcpy(dst[0..n], src[0..n]);
+    return n;
 }
 
 fn applyBypass(app: *App, input: []const f32, output: []f32) void {
-    const d = app.chain.delaySamples();
+    const d = app.slot.delaySamples();
+    if (d == 0) {
+        @memcpy(output, input);
+        return;
+    }
     for (input, 0..) |x, i| {
         const at = (app.delay_pos + i) % app.delay_buf.len;
         const from = (at + app.delay_buf.len - d) % app.delay_buf.len;
-        output[i] = if (d == 0) x else app.delay_buf[from];
+        output[i] = app.delay_buf[from];
         app.delay_buf[at] = x;
     }
     app.delay_pos = (app.delay_pos + input.len) % app.delay_buf.len;
@@ -127,28 +101,66 @@ fn worker(app: *App) void {
             continue;
         }
         const mode: Mode = @enumFromInt(app.mode.load(.acquire));
+        app.mu.lock();
         switch (mode) {
-            .mute => @memset(&output, 0),
+            .mute => {
+                applyBypass(app, &input, &output);
+                @memset(&output, 0);
+            },
             .bypass => applyBypass(app, &input, &output),
-            .suppress => app.chain.process(&input, &output),
+            .suppress => app.slot.process(&input, &output),
         }
+        const listen = app.listen.load(.acquire);
+        app.mu.unlock();
         _ = nm_out_write(&output, block);
-        if (app.listen.load(.acquire)) _ = nm_listen_write(&output, block);
+        if (listen) _ = nm_listen_write(&output, block);
         filled = 0;
     }
 }
 
 fn statusText(allocator: std.mem.Allocator, app: *App) ![]u8 {
     const mode: Mode = @enumFromInt(app.mode.load(.acquire));
-    return std.fmt.allocPrint(allocator, "engine={s}\nmode={s}\nlisten={s}\nstreaming={d}\ndelay_samples={d}\nunderruns={d}\nsource={s}\n", .{
-        engineName(),
+    return std.fmt.allocPrint(allocator, "engine={s}\ngain_db={d}\nmode={s}\nlisten={s}\nstreaming={d}\ndelay_samples={d}\nunderruns={d}\nsource={s}\nshipped={s}\n", .{
+        app.slot.name,
+        app.gain_db,
         @tagName(mode),
         if (app.listen.load(.acquire)) "on" else "off",
         nm_source_streaming(),
-        app.chain.delaySamples(),
+        app.slot.delaySamples(),
         nm_underruns(),
         app.source_name[0..app.source_len],
+        engineName(),
     });
+}
+
+fn persist(app: *App, key: []const u8, rendered: []const u8) void {
+    config.patchFile(app.allocator, app.config_path, key, rendered) catch |err| {
+        std.debug.print("config write failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    if (std.fs.cwd().statFile(app.config_path)) |st| app.config_mtime = st.mtime else |_| {}
+}
+
+fn swapEngine(app: *App, name: []const u8) bool {
+    const avail = engines.availability(name);
+    if (!avail.ok) {
+        std.debug.print("engine {s}: {s}\n", .{ name, avail.reason });
+        return false;
+    }
+    const opened = engines.open(app.allocator, name) catch |err| {
+        std.debug.print("engine {s}: {s}\n", .{ name, @errorName(err) });
+        return false;
+    };
+    var fresh = opened;
+    fresh.setGainDb(app.gain_db);
+    app.mu.lock();
+    app.slot.deinit();
+    app.slot = fresh;
+    app.delay_pos = 0;
+    @memset(&app.delay_buf, 0);
+    app.mu.unlock();
+    app.failed_len = 0;
+    return true;
 }
 
 fn handleCommand(allocator: std.mem.Allocator, app: *App, line: []const u8) ![]u8 {
@@ -164,7 +176,9 @@ fn handleCommand(allocator: std.mem.Allocator, app: *App, line: []const u8) ![]u
         const name = trimmed["mode ".len..];
         const mode = std.meta.stringToEnum(Mode, name) orelse return allocator.dupe(u8, "unknown mode\n");
         app.mode.store(@intFromEnum(mode), .release);
-        saveMode(allocator, app);
+        const rendered = try config.quote(allocator, name);
+        defer allocator.free(rendered);
+        persist(app, "mode", rendered);
         return std.fmt.allocPrint(allocator, "mode={s}\n", .{name});
     }
     if (std.mem.startsWith(u8, trimmed, "listen ")) {
@@ -173,11 +187,109 @@ fn handleCommand(allocator: std.mem.Allocator, app: *App, line: []const u8) ![]u
         if (!on and !std.mem.eql(u8, name, "off")) return allocator.dupe(u8, "use listen on or listen off\n");
         app.listen.store(on, .release);
         nm_set_listen(if (on) 1 else 0);
-        saveMode(allocator, app);
+        persist(app, "listen", if (on) "true" else "false");
         if (on) return allocator.dupe(u8, "listen=on\nHeadphones only. Speakers will feed the microphone.\n");
         return allocator.dupe(u8, "listen=off\n");
     }
-    return allocator.dupe(u8, "commands: status, mode suppress|bypass|mute, listen on|off, quit\n");
+    if (std.mem.startsWith(u8, trimmed, "engine ")) {
+        const name = std.mem.trim(u8, trimmed["engine ".len..], " ");
+        if (!swapEngine(app, name)) return allocator.dupe(u8, "engine unchanged\n");
+        const rendered = try config.quote(allocator, app.slot.name);
+        defer allocator.free(rendered);
+        persist(app, "engine", rendered);
+        return std.fmt.allocPrint(allocator, "engine={s}\ndelay_samples={d}\n", .{ app.slot.name, app.slot.delaySamples() });
+    }
+    if (std.mem.startsWith(u8, trimmed, "gain ")) {
+        const text = std.mem.trim(u8, trimmed["gain ".len..], " ");
+        const value = std.fmt.parseFloat(f32, text) catch return allocator.dupe(u8, "gain must be a number of dB\n");
+        if (!std.math.isFinite(value)) return allocator.dupe(u8, "gain must be finite\n");
+        app.mu.lock();
+        app.gain_db = value;
+        app.slot.setGainDb(value);
+        app.mu.unlock();
+        var buf: [64]u8 = undefined;
+        const rendered = std.fmt.bufPrint(&buf, "{d}", .{value}) catch "0";
+        persist(app, "gain_db", rendered);
+        return std.fmt.allocPrint(allocator, "gain_db={d}\n", .{value});
+    }
+    return allocator.dupe(u8, "commands: status, mode suppress|bypass|mute, listen on|off, engine NAME, gain DB, quit\n");
+}
+
+fn rememberFailure(app: *App, name: []const u8) bool {
+    if (std.mem.eql(u8, name, app.failed_engine[0..app.failed_len])) return false;
+    app.failed_len = copyName(&app.failed_engine, name);
+    return true;
+}
+
+fn applyHot(app: *App, cfg: config.Config) void {
+    app.mode.store(@intFromEnum(cfg.mode), .release);
+    const listen = cfg.listen;
+    if (app.listen.load(.acquire) != listen) {
+        app.listen.store(listen, .release);
+        nm_set_listen(if (listen) 1 else 0);
+    }
+    if (cfg.gain_db != app.gain_db) {
+        app.mu.lock();
+        app.gain_db = cfg.gain_db;
+        app.slot.setGainDb(cfg.gain_db);
+        app.mu.unlock();
+    }
+    if (!std.mem.eql(u8, cfg.engine, app.slot.name)) {
+        const avail = engines.availability(cfg.engine);
+        if (!avail.ok) {
+            if (rememberFailure(app, cfg.engine)) std.debug.print("engine {s}: {s}\n", .{ cfg.engine, avail.reason });
+        } else if (!swapEngine(app, cfg.engine)) {
+            if (rememberFailure(app, cfg.engine)) std.debug.print("engine {s} failed to start\n", .{cfg.engine});
+        } else {
+            std.debug.print("engine={s} delay_samples={d}\n", .{ app.slot.name, app.slot.delaySamples() });
+        }
+    }
+    const running = app.source_name[0..app.source_len];
+    if (!std.mem.eql(u8, cfg.source, running) and !std.mem.eql(u8, cfg.source, app.noted_source[0..app.noted_len])) {
+        std.debug.print("source change applies on restart\n", .{});
+        app.noted_len = copyName(&app.noted_source, cfg.source);
+    }
+}
+
+fn maybeReload(app: *App) void {
+    const st = std.fs.cwd().statFile(app.config_path) catch return;
+    if (st.mtime == app.config_mtime) return;
+    app.config_mtime = st.mtime;
+    const text = std.fs.cwd().readFileAlloc(app.allocator, app.config_path, 64 * 1024) catch |err| {
+        std.debug.print("config.toml: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer app.allocator.free(text);
+    const source_copy = app.allocator.dupe(u8, app.source_name[0..app.source_len]) catch return;
+    const engine_copy = app.allocator.dupe(u8, app.slot.name) catch {
+        app.allocator.free(source_copy);
+        return;
+    };
+    var prev = config.Config{
+        .source = source_copy,
+        .mode = @enumFromInt(app.mode.load(.acquire)),
+        .listen = app.listen.load(.acquire),
+        .engine = engine_copy,
+        .gain_db = app.gain_db,
+        .allocator = app.allocator,
+    };
+    const loaded = config.loadKeeping(app.allocator, &prev, text) catch |err| {
+        prev.deinit();
+        std.debug.print("config.toml: {s}\nkeeping the previous config\n", .{@errorName(err)});
+        return;
+    };
+    switch (loaded) {
+        .err => |msg| {
+            prev.deinit();
+            std.debug.print("{s}\nkeeping the previous config\n", .{msg});
+            app.allocator.free(msg);
+        },
+        .ok => |cfg| {
+            var live = cfg;
+            defer live.deinit();
+            applyHot(app, live);
+        },
+    }
 }
 
 fn serve(app: *App, server: std.posix.socket_t) void {
@@ -190,6 +302,7 @@ fn serve(app: *App, server: std.posix.socket_t) void {
             .revents = 0,
         }};
         const n = std.posix.poll(&fds, 200) catch continue;
+        maybeReload(app);
         if (n == 0) continue;
         const client = std.posix.accept(server, null, null, 0) catch continue;
         defer std.posix.close(client);
@@ -324,10 +437,34 @@ fn setDefault(allocator: std.mem.Allocator, id: []const u8) void {
 }
 
 pub fn runDaemon(allocator: std.mem.Allocator) !void {
-    var app = App{ .chain = shippedChain() };
-    try loadConfig(allocator, &app);
+    var cfg = try config.loadUser(allocator);
+    defer cfg.deinit();
+    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const config_path = try config.configPath(allocator, home);
+    var slot = engines.open(allocator, cfg.engine) catch blk: {
+        const avail = engines.availability(cfg.engine);
+        std.debug.print("engine {s}: {s}\nfalling back to dsp-dereverb\n", .{ cfg.engine, avail.reason });
+        break :blk try engines.open(allocator, "dsp-dereverb");
+    };
+    slot.setGainDb(cfg.gain_db);
+    var app = App{
+        .allocator = allocator,
+        .slot = slot,
+        .gain_db = cfg.gain_db,
+        .config_path = config_path,
+    };
+    app.mode.store(@intFromEnum(cfg.mode), .release);
+    app.listen.store(cfg.listen, .release);
+    if (cfg.source.len != 0) rememberSource(&app, cfg.source);
+    if (std.fs.cwd().statFile(config_path)) |st| app.config_mtime = st.mtime else |_| {}
+    defer {
+        app.slot.deinit();
+        allocator.free(app.config_path);
+    }
+
     chooseCaptureTarget(allocator, &app);
     global_app = &app;
+    defer global_app = null;
     var act = std.posix.Sigaction{
         .handler = .{ .handler = onSignal },
         .mask = std.posix.empty_sigset,
@@ -338,13 +475,23 @@ pub fn runDaemon(allocator: std.mem.Allocator) !void {
 
     var path_buf: [128]u8 = undefined;
     const path = try socketPath(&path_buf);
+    if (daemonListening(path)) {
+        std.debug.print("NearMic is already running\n", .{});
+        return;
+    }
     std.posix.unlink(path) catch {};
     const server = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
     defer std.posix.close(server);
     var addr = std.mem.zeroes(std.posix.sockaddr.un);
     addr.family = std.posix.AF.UNIX;
     @memcpy(addr.path[0..path.len], path);
-    try std.posix.bind(server, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
+    std.posix.bind(server, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un)) catch |err| {
+        if (err == error.AddressInUse) {
+            std.debug.print("NearMic is already running\n", .{});
+            return;
+        }
+        return err;
+    };
     try std.posix.listen(server, 4);
     defer std.posix.unlink(path) catch {};
 
@@ -369,22 +516,28 @@ pub fn runDaemon(allocator: std.mem.Allocator) !void {
     const node = nm_pw_node_id();
     const node_text = std.fmt.bufPrint(&id_buf, "{d}", .{node}) catch "";
     const restore = if (std.posix.getenv("NEARMIC_NO_DEFAULT") == null) previousDefault(allocator) else null;
-    defer if (restore) |id| {
-        allocator.free(id);
-    };
+    defer if (restore) |id| allocator.free(id);
     if (node != 0 and std.posix.getenv("NEARMIC_NO_DEFAULT") == null) setDefault(allocator, node_text);
 
     std.debug.print("NearMic {s} is running ({s}, {d} sample delay). Pick NearMic as the microphone.\n", .{
         version,
-        engineName(),
-        app.chain.delaySamples(),
+        app.slot.name,
+        app.slot.delaySamples(),
     });
     if (restore) |id| {
         defer setDefault(allocator, id);
         serve(&app, server);
-    } else {
-        serve(&app, server);
-    }
+    } else serve(&app, server);
+}
+
+fn daemonListening(path: []const u8) bool {
+    const sock = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch return false;
+    defer std.posix.close(sock);
+    var addr = std.mem.zeroes(std.posix.sockaddr.un);
+    addr.family = std.posix.AF.UNIX;
+    @memcpy(addr.path[0..path.len], path);
+    std.posix.connect(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un)) catch return false;
+    return true;
 }
 
 pub fn sendCommand(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
@@ -412,16 +565,27 @@ pub fn sendCommand(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
 }
 
 pub fn enhance(allocator: std.mem.Allocator, in_path: []const u8, out_path: []const u8) !void {
+    var cfg = try config.loadUser(allocator);
+    defer cfg.deinit();
     var pcm = try wav.readWav(allocator, in_path);
     defer pcm.deinit();
     const n = pcm.samples.len - (pcm.samples.len % dsp.hop);
     if (n == 0) return error.TooShort;
+    var slot = engines.open(allocator, cfg.engine) catch {
+        const avail = engines.availability(cfg.engine);
+        std.debug.print("engine {s}: {s}\n", .{ cfg.engine, avail.reason });
+        return error.Unavailable;
+    };
+    defer slot.deinit();
+    slot.setGainDb(cfg.gain_db);
     const output = try allocator.alloc(f32, n);
     defer allocator.free(output);
-    var chain = shippedChain();
-    chain.process(pcm.samples[0..n], output);
+    var offset: usize = 0;
+    while (offset < n) : (offset += dsp.hop) {
+        slot.process(pcm.samples[offset..][0..dsp.hop], output[offset..][0..dsp.hop]);
+    }
     try wav.writeWav(out_path, output);
-    std.debug.print("wrote {s} ({d} samples, engine {s})\n", .{ out_path, n, engineName() });
+    std.debug.print("wrote {s} ({d} samples, engine {s})\n", .{ out_path, n, slot.name });
 }
 
 pub fn pipewireLibraryPresent() bool {

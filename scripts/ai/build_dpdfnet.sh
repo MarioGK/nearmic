@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
-ROOT=/tmp/hushmic/crates/hushmic-denoiser/native
-OUT=/tmp/dpdf-build
+ROOT=${HUSHMIC_NATIVE:-/tmp/hushmic/crates/hushmic-denoiser/native}
+OUT=${DPDF_OUT:-/tmp/dpdf-build}
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
@@ -54,4 +54,6 @@ build_model 8 dpdfnet8_48khz_hr
 build_model 2 dpdfnet2_48khz_hr
 compile_one "$ROOT/src/runtime.c" "$OUT/runtime.c.o"
 ar rcs "$OUT/libdpdfnet.a" "$OUT"/*/*.o "$OUT/runtime.c.o"
+mkdir -p "$OUT/include"
+cp "$ROOT/include/dpdfnet.h" "$OUT/include/dpdfnet.h"
 echo "built $OUT/libdpdfnet.a"

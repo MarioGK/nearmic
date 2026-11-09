@@ -160,6 +160,31 @@ fn dbOf(lin: f32) f32 {
     return 20 * std.math.log10(lin);
 }
 
+pub const Loudness = struct {
+    speech_db: f32,
+    speech_in_db: f32,
+    pause_out_db: f32,
+    pause_in_db: f32,
+    ok: bool,
+};
+
+pub fn loudnessGate(far: Fixture, output: []const f32, delay: usize) Loudness {
+    const skip: usize = 48000 / 2;
+    const speech_db = dbOf(maskedRms(output, far.speech, 1, skip, delay));
+    const pause_out_db = dbOf(maskedRms(output, far.speech, 0, skip, delay));
+    const speech_in_db = dbOf(maskedRms(far.samples, far.speech, 1, skip, 0));
+    const pause_in_db = dbOf(maskedRms(far.samples, far.speech, 0, skip, 0));
+    const loud_err = @abs(speech_db - dsp.target_db);
+    const pauses_ok = pause_out_db < -42 or pause_out_db <= pause_in_db + 6;
+    return .{
+        .speech_db = speech_db,
+        .speech_in_db = speech_in_db,
+        .pause_out_db = pause_out_db,
+        .pause_in_db = pause_in_db,
+        .ok = speech_db > -36 and loud_err <= 8 and pauses_ok,
+    };
+}
+
 fn tailRatio(samples: []const f32, delay: usize) f32 {
     if (delay >= samples.len) return 1;
     const peak_at = delay;
