@@ -27,7 +27,21 @@ log() { echo "nearmic-health: $*"; }
 # Without the overlay/UDC there is no gadget to repair; restarting units would
 # only hide that, and the gadget unit itself refuses to start. A reboot is the
 # only fix, and the operator has to schedule it.
-[ -e "/sys/class/udc/$GADGET" ] || exit 0
+[ -e "/sys/class/udc/$GADGET" ] || # 8. The gadget sink is the microphone the host records. WirePlumber restored
+#    this node at volume 0.46 once, which made the whole microphone quiet even
+#    though the DSP was at full level. The appliance path is unity.
+if command -v wpctl >/dev/null 2>&1; then
+	id="$(pw-cli ls Node 2>/dev/null | awk -v n="$SINK" '
+		/^[[:space:]]*id [0-9]+,/ { id=$2; sub(/,.*/, "", id) }
+		index($0, "node.name = \"" n "\"") { print id; exit }
+	')"
+	if [ -n "$id" ]; then
+		wpctl set-mute "$id" 0 >/dev/null 2>&1 || true
+		wpctl set-volume "$id" 1.0 >/dev/null 2>&1 || true
+	fi
+fi
+
+exit 0
 
 # 1. System gadget unit. It is a oneshot with RemainAfterExit=yes, so it stays
 #    "active" unless it failed; a failed start after re-enumeration is the case

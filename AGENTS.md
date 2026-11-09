@@ -306,8 +306,10 @@ the NearMic source back into the Maono sink.
   60 s. It restarts the gadget/units if they are down, restarts NearMic if it
   is active but `streaming=0`, re-applies the default sink, re-creates a
   missing fixed route, restores the 128-frame quantum after a PipeWire restart,
-  and undoes the error mute once the passthrough is real again. It prints
-  nothing while the board is healthy.
+  and undoes the error mute once the passthrough is real again. It also forces
+  the gadget sink to volume 1.0: WirePlumber restored it at 0.46 once, which
+  made the whole microphone quiet even though the DSP was at full level. It
+  prints nothing while the board is healthy.
 - `nearmic-gadget.service`: system oneshot, `RemainAfterExit=yes`,
   `Restart=no`. A failure means the overlay/UDC is wrong; restarting would
   hide it.
