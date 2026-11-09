@@ -1,0 +1,30 @@
+// NearMic appliance: unattended full upgrades from every configured origin.
+// This includes Debian main, Armbian and any third-party repo already enabled
+// on the board.  Keep the board on a trusted network and review enabled repos
+// before adding new ones.
+Unattended-Upgrade::Origins-Pattern {
+        "origin=*";
+};
+
+// No package blacklist: this is a dedicated appliance.
+
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::InstallOnShutdown "false";
+
+// Reclaim eMMC space after kernel/library transitions.
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+
+// Maintenance window.  The USB microphone is unavailable during the reboot.
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "true";
+Unattended-Upgrade::Automatic-Reboot-Time "04:00";
+
+// Always-on Ethernet appliance.
+Unattended-Upgrade::OnlyOnACPower "false";
+Unattended-Upgrade::Skip-Updates-On-Metered-Connection "false";
+
+Unattended-Upgrade::SyslogEnable "true";
+Unattended-Upgrade::SyslogFacility "daemon";

@@ -1,0 +1,18 @@
+[Unit]
+Description=UAC2 gadget headphone passthrough to Maono playback
+Documentation=file:///usr/local/share/doc/nearmic/AUDIO.md
+After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/nearmic-headphone-link
+Restart=always
+RestartSec=2
+Environment=NEARMIC_HEADPHONE_TIMEOUT=120
+Environment=NEARMIC_HEADPHONE_INTERVAL=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

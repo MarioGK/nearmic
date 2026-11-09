@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libpipewire-0.3-dev libspeexdsp-dev libfftw3-dev build-essential autoconf automake libtool curl
+      - name: Install Zig 0.14.1
+        run: |
+          curl -fsSL -o /tmp/zig.tar.xz https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz
+          sudo tar -C /usr/local -xf /tmp/zig.tar.xz
+          echo /usr/local/zig-x86_64-linux-0.14.1 >> "$GITHUB_PATH"
+      - name: Bundle RNNoise and DPDFNet
+        run: sh scripts/bundle.sh
+      - name: Test and build
+        run: |
+          zig build test -Dbundle=true
+          zig build -Doptimize=ReleaseFast -Dbundle=true
+          sh scripts/check-ldd.sh zig-out/bin/nearmic
+          ./zig-out/bin/nearmic qa | tee /tmp/nearmic-qa.txt
+          grep -E 'rnnoise +pass' /tmp/nearmic-qa.txt
+          grep -E 'dpdfnet2 +pass' /tmp/nearmic-qa.txt
+          grep -E 'dpdfnet8 +pass' /tmp/nearmic-qa.txt
+          cp zig-out/bin/nearmic nearmic-linux-x86_64
+          sha256sum nearmic-linux-x86_64 > SHA256SUMS
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            nearmic-linux-x86_64
+            SHA256SUMS

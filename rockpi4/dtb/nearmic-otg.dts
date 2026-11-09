@@ -1,0 +1,27 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * NearMic UAC2 gadget overlay for the Radxa ROCK 4 Plus V1.73 (RK3399).
+ *
+ * The stock Armbian rk3399-rock-pi-4b-plus.dtb sets both dwc3 controllers to
+ * dr_mode = "host".  The upper USB 3.0 Type-A port is wired to OTG0
+ * (usbdrd3_0 / usb@fe800000).  Switch only that controller to peripheral so
+ * the configfs UAC2 gadget can bind.  The lower USB 3.0 Type-A port remains a
+ * host port for the real USB microphone.
+ *
+ * Install as /boot/overlay-user/nearmic-otg.dtbo and add
+ * user_overlays=nearmic-otg to /boot/armbianEnv.txt.  Reboot is required.
+ */
+/ {
+	compatible = "radxa,rockpi4b-plus", "radxa,rockpi4", "rockchip,rk3399";
+
+	fragment@0 {
+		target-path = "/usb@fe800000/usb@fe800000";
+		__overlay__ {
+			dr_mode = "peripheral";
+			maximum-speed = "high-speed";
+			status = "okay";
+		};
+	};
+};

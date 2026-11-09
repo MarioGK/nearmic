@@ -1,0 +1,6 @@
+.zig-cache/
+zig-out/
+zig-out-arm/
+bench/fixtures/*.wav
+*.wav
+third_party/

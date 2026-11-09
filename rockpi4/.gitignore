@@ -1,0 +1,5 @@
+credentials.txt
+work/
+*.img
+*.img.xz
+*.bin

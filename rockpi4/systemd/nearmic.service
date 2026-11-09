@@ -1,0 +1,28 @@
+[Unit]
+Description=NearMic virtual microphone
+Documentation=file:///usr/local/share/doc/nearmic/AUDIO.md
+After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+# Set the UAC2 gadget as the board default sink before NearMic creates its
+# source, so WirePlumber auto-connects the processed source to the computer
+# microphone path instead of the Maono headphone sink.
+ExecStartPre=-%h/.local/bin/nearmic-default-sink
+ExecStart=%h/.local/bin/nearmic run
+Restart=always
+RestartSec=2
+Nice=-10
+# These limits only work if the user manager inherited a matching hard limit.
+# apply-appliance.sh installs /etc/security/limits.d/99-nearmic-limits.conf and
+# /etc/systemd/system/user@.service.d/99-nearmic-limits.conf for that reason.
+LimitNICE=-10
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+Environment=NEARMIC_NO_DEFAULT=1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

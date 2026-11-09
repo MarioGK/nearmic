@@ -1,0 +1,18 @@
+[Unit]
+Description=NearMic source to UAC2 gadget link
+Documentation=file:///usr/local/share/doc/nearmic/AUDIO.md
+After=pipewire.service wireplumber.service nearmic.service
+Wants=pipewire.service wireplumber.service nearmic.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/nearmic-link
+Restart=always
+RestartSec=2
+Environment=NEARMIC_LINK_TIMEOUT=120
+Environment=NEARMIC_LINK_INTERVAL=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

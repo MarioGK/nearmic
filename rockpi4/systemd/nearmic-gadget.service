@@ -1,0 +1,25 @@
+[Unit]
+Description=NearMic UAC2 duplex USB audio gadget
+Documentation=file:///usr/local/share/doc/nearmic/AUDIO.md
+DefaultDependencies=no
+After=local-fs.target sys-kernel-config.mount
+Wants=sys-kernel-config.mount
+# Start before the system PipeWire (when used) and before the per-user manager
+# that normally hosts the user PipeWire/WirePlumber/NearMic units.
+Before=pipewire.service pipewire-pulse.service wireplumber.service user@1000.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/nearmic-gadget-setup start
+ExecStop=/usr/local/sbin/nearmic-gadget-setup stop
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+# The gadget is deliberately not restarted automatically.  A failed start
+# almost always means the OTG overlay is missing or the UDC is in host mode;
+# restarting in a loop would hide that.  `apply-appliance.sh --apply` or a
+# coordinated reboot fixes it.
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
