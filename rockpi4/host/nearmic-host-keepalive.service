@@ -1,0 +1,18 @@
+[Unit]
+Description=Keep the NearMic USB microphone streaming
+Documentation=file:///home/mariogk/Projects/nearmic/rockpi4/README.md
+After=wireplumber.service pipewire.service
+PartOf=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/nearmic-host-keepalive
+Restart=always
+RestartSec=3
+Nice=10
+# The stream is discarded; keep the journal quiet.
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=default.target

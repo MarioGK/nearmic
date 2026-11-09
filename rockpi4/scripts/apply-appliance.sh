@@ -165,6 +165,7 @@ do_install "$SRC/scripts/setup-uac2-gadget.sh" /usr/local/sbin/nearmic-gadget-se
 do_install "$SRC/scripts/nearmic-link.sh" "$BOARD_HOME/.local/bin/nearmic-link" 0755 "$BOARD_USER:$BOARD_GID"
 do_install "$SRC/scripts/nearmic-default-sink.sh" "$BOARD_HOME/.local/bin/nearmic-default-sink" 0755 "$BOARD_USER:$BOARD_GID"
 do_install "$SRC/scripts/nearmic-headphone-link.sh" "$BOARD_HOME/.local/bin/nearmic-headphone-link" 0755 "$BOARD_USER:$BOARD_GID"
+do_install "$SRC/scripts/nearmic-health.sh" "$BOARD_HOME/.local/bin/nearmic-health" 0755 "$BOARD_USER:$BOARD_GID"
 
 # --------------------------------------------------------------- nearMic cfg
 CONFIG_DST="$BOARD_HOME/.config/nearmic/config.toml"
@@ -179,6 +180,15 @@ do_install "$SRC/systemd/nearmic-gadget.service" /etc/systemd/system/nearmic-gad
 do_install "$SRC/systemd/nearmic.service" "$BOARD_HOME/.config/systemd/user/nearmic.service" 0644 "$BOARD_USER:$BOARD_GID"
 do_install "$SRC/systemd/nearmic-link.service" "$BOARD_HOME/.config/systemd/user/nearmic-link.service" 0644 "$BOARD_USER:$BOARD_GID"
 do_install "$SRC/systemd/nearmic-headphone-link.service" "$BOARD_HOME/.config/systemd/user/nearmic-headphone-link.service" 0644 "$BOARD_USER:$BOARD_GID"
+do_install "$SRC/systemd/nearmic-health.service" "$BOARD_HOME/.config/systemd/user/nearmic-health.service" 0644 "$BOARD_USER:$BOARD_GID"
+do_install "$SRC/systemd/nearmic-health.timer" "$BOARD_HOME/.config/systemd/user/nearmic-health.timer" 0644 "$BOARD_USER:$BOARD_GID"
+
+# ------------------------------------------------------- pipewire/wireplumber
+# System drop-in: keep the UAC2 gadget and the Maono interface streaming (no
+# suspend-on-idle) and shrink the ALSA periods so the host's first sample is
+# not behind 340 ms of stale buffer.  See the file for the latency budget.
+do_install "$SRC/wireplumber/51-nearmic-latency.conf" \
+	/etc/wireplumber/wireplumber.conf.d/51-nearmic-latency.conf 0644 root:root
 
 # ----------------------------------------------------------------- apt/system
 do_install "$SRC/apt/20auto-upgrades" /etc/apt/apt.conf.d/20auto-upgrades 0644 root:root
@@ -219,6 +229,8 @@ if [ -x "$BOARD_HOME/.local/bin/nearmic" ] || [ "$APPLY" -eq 0 ]; then
 		warn "could not enable nearmic/nearmic-link/nearmic-headphone-link user units"
 	run_as_user systemctl --user restart nearmic.service nearmic-link.service nearmic-headphone-link.service ||
 		warn "could not start nearmic/nearmic-link/nearmic-headphone-link user units"
+	run_as_user systemctl --user enable --now nearmic-health.timer ||
+		warn "could not enable nearmic-health.timer"
 else
 	warn "NearMic binary missing; not starting nearmic.service"
 fi

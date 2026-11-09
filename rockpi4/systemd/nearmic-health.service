@@ -1,0 +1,13 @@
+[Unit]
+Description=NearMic 24/7 health check
+Documentation=file:///usr/local/share/doc/nearmic/AUDIO.md
+# Do not start before the user manager and PipeWire exist; the first timer
+# tick also runs after boot, so a missing dependency is not a problem.
+After=pipewire.service wireplumber.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/nearmic-health
+# Never compete with the audio path.
+Nice=10
+TimeoutStartSec=45

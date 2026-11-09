@@ -1,0 +1,14 @@
+[Unit]
+Description=NearMic 24/7 health check
+
+[Timer]
+# First check shortly after boot, then once a minute. The check is a handful
+# of systemctl/pw-link calls and exits immediately, so it is cheap enough to
+# keep the microphone path self-healing after a USB replug.
+OnBootSec=45s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=nearmic-health.service
+
+[Install]
+WantedBy=timers.target

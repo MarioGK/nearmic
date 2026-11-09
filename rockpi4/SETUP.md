@@ -42,7 +42,13 @@ Set `NEARMIC_USER` to install for a user other than `mariogk`. Set
 | `systemd/nearmic-gadget.service` | `/etc/systemd/system/nearmic-gadget.service` | `0644 root:root` | System oneshot, before user PipeWire; `Restart=no` |
 | `scripts/nearmic-link.sh` | `~/.local/bin/nearmic-link` | `0755 mariogk` | Wait for `nearmic` + UAC2 sink, `pw-link`, supervise |
 | `systemd/nearmic-link.service` | `~/.config/systemd/user/nearmic-link.service` | `0644 mariogk` | User link supervisor, `Restart=always` |
-| `scripts/nearmic-default-sink.sh` | `~/.local/bin/nearmic-default-sink` | `0755 mariogk` | `ExecStartPre` helper: UAC2 gadget as default sink |
+| `scripts/nearmic-default-sink.sh` | `~/.local/bin/nearmic-default-sink` | `0755 mariogk` | `ExecStartPre` helper: UAC2 gadget default sink + 128-frame quantum |
+| `scripts/nearmic-health.sh` | `~/.local/bin/nearmic-health` | `0755 mariogk` | 24/7 self check run by the health timer |
+| `systemd/nearmic-health.service` | `~/.config/systemd/user/nearmic-health.service` | `0644 mariogk` | One-shot health check unit |
+| `systemd/nearmic-health.timer` | `~/.config/systemd/user/nearmic-health.timer` | `0644 mariogk` | Every 60 s, first run 45 s after boot |
+| `wireplumber/51-nearmic-latency.conf` | `/etc/wireplumber/wireplumber.conf.d/51-nearmic-latency.conf` | `0644 root` | No suspend-on-idle, 128-frame ALSA periods |
+| `host/nearmic-host-keepalive.sh` | `~/.local/bin/nearmic-host-keepalive` on the **host** | `0755` | Optional: keep the host's NearMic source streaming |
+| `host/nearmic-host-keepalive.service` | `~/.config/systemd/user/nearmic-host-keepalive.service` on the **host** | `0644` | Optional host user unit for the keepalive |
 | `scripts/nearmic-headphone-link.sh` | `~/.local/bin/nearmic-headphone-link` | `0755 mariogk` | Wait for UAC2 capture + Maono sink, `pw-link` stereo passthrough, supervise |
 | `systemd/nearmic-headphone-link.service` | `~/.config/systemd/user/nearmic-headphone-link.service` | `0644 mariogk` | User headphone link supervisor, `Restart=always` |
 | `systemd/nearmic.service` | `~/.config/systemd/user/nearmic.service` | `0644 mariogk` | Full NearMic unit: `Restart=always`, `Nice=-10`, RT/memlock limits |
@@ -182,6 +188,10 @@ install -D -m 0755 scripts/nearmic-headphone-link.sh ~/.local/bin/nearmic-headph
 install -D -m 0644 systemd/nearmic.service ~/.config/systemd/user/nearmic.service
 install -D -m 0644 systemd/nearmic-link.service ~/.config/systemd/user/nearmic-link.service
 install -D -m 0755 scripts/nearmic-default-sink.sh ~/.local/bin/nearmic-default-sink
+install -D -m 0755 scripts/nearmic-health.sh ~/.local/bin/nearmic-health
+install -D -m 0644 systemd/nearmic-health.service ~/.config/systemd/user/nearmic-health.service
+install -D -m 0644 systemd/nearmic-health.timer ~/.config/systemd/user/nearmic-health.timer
+systemctl --user enable --now nearmic-health.timer
 install -D -m 0644 systemd/nearmic-headphone-link.service ~/.config/systemd/user/nearmic-headphone-link.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now nearmic-gadget.service

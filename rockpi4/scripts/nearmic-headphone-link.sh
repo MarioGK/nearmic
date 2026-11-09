@@ -30,8 +30,39 @@ SINK="${NEARMIC_HEADPHONE_SINK:-}"
 TIMEOUT="${NEARMIC_HEADPHONE_TIMEOUT:-120}"
 INTERVAL="${NEARMIC_HEADPHONE_INTERVAL:-5}"
 LINKED=""
+RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+MUTE_FLAG="$RUNTIME/nearmic-maono-muted"
 
 log() { printf 'nearmic-headphone: %s\n' "$*" >&2; }
+
+sink_id() {
+	[ -n "${SINK:-}" ] || return 1
+	pw-cli ls Node 2>/dev/null | awk -v n="$SINK" '
+		/^[[:space:]]*id [0-9]+,/ { id=$2; sub(/,.*/, "", id) }
+		index($0, "node.name = \"" n "\"") { print id; exit }
+	'
+}
+
+# The Maono headphone amp turns a broken UAC2 stream (gadget reset, underrun,
+# stalled graph, half-open link) into a loud high-pitched tone. When this route
+# cannot be maintained, mute the interface so the failure is silent. The flag
+# file means we only ever unmute a sink that we muted ourselves, never one the
+# operator muted by hand.
+maono_mute() {
+	id="$(sink_id || true)"
+	[ -n "$id" ] || return 0
+	wpctl set-mute "$id" 1 >/dev/null 2>&1 || return 0
+	: >"$MUTE_FLAG" 2>/dev/null || true
+	log "muted ${SINK} until the passthrough is healthy"
+}
+
+maono_unmute() {
+	[ -e "$MUTE_FLAG" ] || return 0
+	id="$(sink_id || true)"
+	[ -n "$id" ] || return 0
+	wpctl set-mute "$id" 0 >/dev/null 2>&1 || return 0
+	rm -f "$MUTE_FLAG" 2>/dev/null || true
+}
 
 output_ports() {
 	pw-link -o 2>/dev/null |
@@ -189,6 +220,7 @@ wait_for_nodes() {
 			noticed=1
 		fi
 		if [ "$waited" -ge "$TIMEOUT" ]; then
+			maono_mute
 			log "timed out after ${TIMEOUT}s"
 			log "output ports:"
 			pw-link -o 2>/dev/null | sed 's/^/  /' >&2 || true
@@ -212,15 +244,19 @@ log "source ${SOURCE} ports: $(output_ports "$SOURCE" | tr '\n' ' ')"
 log "sink ${SINK} ports: $(input_ports "$SINK" | tr '\n' ' ')"
 
 make_links || exit 1
+maono_unmute
 
 while :; do
 	sleep "$INTERVAL"
 	if ! output_ports "$SOURCE" | grep -q . || ! input_ports "$SINK" | grep -q .; then
+		maono_mute
 		log "source or sink disappeared; exiting for systemd restart"
 		exit 1
 	fi
 	if ! make_links; then
+		maono_mute
 		log "could not restore links; exiting for systemd restart"
 		exit 1
 	fi
+	maono_unmute
 done

@@ -100,9 +100,13 @@ USB 2.0 ports remain host ports.
 | `rockpi4/dtb/` | NearMic OTG overlay |
 | `rockpi4/scripts/setup-uac2-gadget.sh` | configfs UAC2 gadget setup/stop |
 | `rockpi4/scripts/nearmic-link.sh` | PipeWire source-to-gadget-sink supervisor; sets the gadget default sink and prunes foreign source links |
-| `rockpi4/scripts/nearmic-default-sink.sh` | `ExecStartPre` helper: make the UAC2 gadget the WirePlumber default sink |
+| `rockpi4/scripts/nearmic-default-sink.sh` | `ExecStartPre` helper: UAC2 gadget default sink and 128-frame graph quantum |
 | `rockpi4/QUALITY.md` | RNNoise/LocalVQE/DPDFNet analysis, old robotic-chain root cause, measurements, build |
-| `rockpi4/scripts/nearmic-headphone-link.sh` | UAC2 capture-to-Maono playback passthrough supervisor |
+| `rockpi4/scripts/nearmic-headphone-link.sh` | UAC2 capture-to-Maono playback passthrough supervisor; mutes the Maono output when the route breaks (no squeal) |
+| `rockpi4/scripts/nearmic-health.sh` | One-shot 24/7 self check: gadget, units, streaming, default sink, routes, quantum |
+| `rockpi4/systemd/nearmic-health.{service,timer}` | User timer that runs the health check every 60 s |
+| `rockpi4/wireplumber/51-nearmic-latency.conf` | No suspend-on-idle and 128-frame ALSA periods for the UAC2 gadget |
+| `rockpi4/host/` | Optional host-computer keepalive that holds the microphone open |
 | `rockpi4/scripts/apply-appliance.sh` | Idempotent appliance installer |
 | `rockpi4/systemd/` | Gadget, NearMic and link units, limits drop-in |
 | `rockpi4/apt/` | Unattended upgrades and needrestart policy |
@@ -182,11 +186,17 @@ cpu_budget = 0.80
   so the appliance pins `threads = 1` and `cpu_budget = 0.80`; the user allows
   up to 80 % CPU, but a heavier full-band model is not available on aarch64.
 - `engine = "rnnoise"` is the best full-band 48 kHz neural denoiser that builds
-  and runs on this board. `voice.Post` adds a 75 Hz high-pass, low shelf,
-  +2 dB presence shelf, downward-only leveler and soft limiter. The legacy
+  and runs on this board. `voice.Post` adds a 75 Hz high-pass, -1 dB low
+  shelf, +3 dB presence shelf, +1.5 dB air shelf, a speech leveler and a soft
+  limiter. The legacy
   `dsp`/`dsp-dereverb` engines remain selectable but are not the default. See
   [rockpi4/QUALITY.md](rockpi4/QUALITY.md).
-- `gain_db = 10` is the RNNoise makeup gain; the post leveler is downward-only.
+- `gain_db = 10` is the RNNoise makeup gain. `voice.Post` then runs a
+  speech leveler: 3:1 compression above -18 dBFS and up to +16 dB of lift
+  below it, scaled by how far the level sits above the tracked noise floor.
+  Loud and far-field speech therefore land in the same range without raising
+  the noise RNNoise removed. Do not raise `gain_db` to get far-field level;
+  the leveler already does that and a higher input just compresses more.
 - `source` is the PipeWire `node.name` of the real microphone. Leaving it
   empty is racy on a headless boot; discover and set it explicitly.
 - `mode = "suppress"`, `listen = false`. Do not enable `listen` on the
@@ -287,7 +297,17 @@ the NearMic source back into the Maono sink.
   also sets the gadget as the default sink and prunes any NearMic source link
   to a sink other than the UAC2 gadget.
 - `nearmic-headphone-link.service`: `Restart=always`, `RestartSec=2`; same
-  wait/exit/re-link behaviour for the UAC2 capture source and Maono sink.
+  wait/exit/re-link behaviour for the UAC2 capture source and Maono sink. If
+  the route breaks it removes the links and **mutes the Maono output** before
+  exiting, because the interface turns a broken UAC2 stream into a loud
+  high-pitched tone. The mute flag is `$XDG_RUNTIME_DIR/nearmic-maono-muted`,
+  so only a mute applied by these scripts is ever undone.
+- `nearmic-health.timer`: user timer, first run 45 s after boot then every
+  60 s. It restarts the gadget/units if they are down, restarts NearMic if it
+  is active but `streaming=0`, re-applies the default sink, re-creates a
+  missing fixed route, restores the 128-frame quantum after a PipeWire restart,
+  and undoes the error mute once the passthrough is real again. It prints
+  nothing while the board is healthy.
 - `nearmic-gadget.service`: system oneshot, `RemainAfterExit=yes`,
   `Restart=no`. A failure means the overlay/UDC is wrong; restarting would
   hide it.
@@ -298,6 +318,35 @@ the NearMic source back into the Maono sink.
 - Maintenance reboot window is **04:00** local time, driven by
   `unattended-upgrades`. The host will see the microphone disconnect during
   that window.
+
+## Latency budget
+
+The microphone path is tuned for the shortest delay from speech to the host,
+not for the lowest CPU. Measured on the board:
+
+| Stage | Setting | Latency |
+| --- | --- | --- |
+| RNNoise | 480-sample frame (algorithmic) | 10.0 ms |
+| NearMic output ring | servo target/cap 768/1536 frames | 16.0-32.0 ms |
+| PipeWire graph | `clock.force-quantum = 128` frames | 2.7 ms |
+| UAC2 ALSA | 128-frame periods, 16 periods | 2.7 ms granularity |
+| **Board total** | | **~29-45 ms** |
+
+- `nearmic-default-sink` sets `clock.force-quantum 128` on every start and
+  `nearmic-health` restores it after a PipeWire restart.
+- `rockpi4/wireplumber/51-nearmic-latency.conf` sets
+  `session.suspend-timeout-seconds = 0` and `node.pause-on-idle = false` for
+  the gadget and Maono nodes. An idle node stays open instead of being closed
+  and reopened, which is what used to cause the heard "activation" delay.
+- `src/asrc.zig` must keep its invariants: `1 <= pos` and `pos + 2 < len`
+  while `canRead()` is true. A compaction bug that dropped more samples than
+  were buffered crashed the service with SIGSEGV every few seconds; the
+  systemd restart hid it. `zig build test` covers starvation and full-buffer
+  cases.
+- Optional, on the host computer: `rockpi4/host/nearmic-host-keepalive.sh`
+  keeps one silent consumer on the host's NearMic source so the USB node never
+  idles. Without it the host may resume the node when an application opens the
+  microphone.
 
 ## Automatic apt policy
 

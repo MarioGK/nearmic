@@ -33,12 +33,21 @@ The previous `dsp-dereverb` + `rock-pi-plus` ensemble had:
 Maono input 1
   -> RNNoise (learned full-band denoiser, 48 kHz)
   -> voice.Post: 75 Hz HPF, low shelf -1 dB @250 Hz,
-                 +2 dB presence @3 kHz, downward-only 3:1 leveler
-                 (threshold -18 dBFS, 20/300 ms), soft limiter -1.5 dBFS
+                 +3 dB presence @3 kHz, +1.5 dB air @7 kHz,
+                 speech leveler (3:1 above -18 dBFS, up to +16 dB lift
+                 below it, scaled by presence over the tracked noise
+                 floor), soft limiter -1.5 dBFS
   -> NearMic source `nearmic` (capture_MONO)
   -> UAC2 gadget playback_MONO
   -> host microphone
 ```
+
+The leveler is the far-field fix. A plain makeup gain would have to lift the
+noise floor by the same 6-16 dB; this one measures the level against a
+15 s-rise noise floor and only applies lift while the signal is above it, so
+quiet speech arrives at the same loudness as close speech and pauses stay
+quiet. Presence and air shelves restore the high end that distance and room
+absorption remove, which is most of the "sounds far away" cue.
 
 `src/app.zig` also runs a fractional ASRC with a proportional drift servo
 (target reserve 2048 samples, ratio 0.985–1.015) to absorb the USB clock
@@ -56,8 +65,12 @@ difference between the Maono capture and the UAC2 gadget.
 Live board:
 
 - `engine=rnnoise`, `gain_db=10`, `threads=1`, `cpu_budget=0.80`
-- `underruns=0` (one startup underrun only); `out_fill=1280–2304`
-- ~36 % of one core = ~6 % of the 6-core RK3399
+- `underruns=0` after start; `out_fill=768–1024` (16-21 ms of ring)
+- 128-frame graph (`clock.force-quantum=128`), 128-frame UAC2 ALSA periods
+- ~36 % of one core = ~6 % of the 6-core RK3399; ~23 MB RSS
+- `nearmic qa`: p99 0.90 ms per 5.33 ms block, about 6x faster than realtime
+- board latency budget ~29-45 ms end to end, measured from the ring fill,
+  graph quantum and the 480-sample RNNoise frame
 - `qa`: `rock-pi-plus`, p99 ~1.38 ms per 5.33 ms hop
 
 ## Build

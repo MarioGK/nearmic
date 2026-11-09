@@ -68,8 +68,10 @@ const App = struct {
 };
 
 var global_app: ?*App = null;
+var exit_signal: c_int = 0;
 
-fn onSignal(_: c_int) callconv(.C) void {
+fn onSignal(sig: c_int) callconv(.C) void {
+    exit_signal = sig;
     if (global_app) |app| app.alive.store(false, .release);
 }
 
@@ -138,8 +140,10 @@ fn worker(app: *App) void {
     var silence: [512]f32 = .{0} ** 512;
     // Drift servo: the ring fill is the integral of the clock difference, so
     // a proportional ratio correction is a first-order loop with no overshoot.
-    // Measured deficit is 0.51%, which settles the fill at ~75% of target.
-    const target: f64 = 2048;
+    // Proportional drift servo on the output reserve. The reserve is latency:
+    // keep it near 16 ms. Measured deficit is 0.51%, which this loop still
+    // absorbs inside the 0.985-1.015 ratio clamp.
+    const target: f64 = 768;
     while (app.alive.load(.acquire)) {
         const refill = nm_out_take_refill();
         if (refill > 0) {
@@ -155,8 +159,8 @@ fn worker(app: *App) void {
             // absent (boot, replug, host not capturing). Otherwise the source
             // callback drains the reserve and every gap becomes an underrun.
             var level = nm_out_level();
-            while (level < 2048) {
-                const n = @min(silence.len, 2048 - level);
+            while (level < 768) {
+                const n = @min(silence.len, 768 - level);
                 _ = nm_out_write(&silence, @intCast(n));
                 level += n;
             }
@@ -169,7 +173,7 @@ fn worker(app: *App) void {
             resample.write(capture[0..got]);
         }
         var produced: usize = 0;
-        while (resample.canRead(block) and nm_out_level() < 4096 and produced < 8) {
+        while (resample.canRead(block) and nm_out_level() < 1536 and produced < 8) {
             const level: f64 = @floatFromInt(nm_out_level());
             const err = (level - target) / target;
             resample.ratio = std.math.clamp(1.0 + 0.02 * err, 0.985, 1.015);
@@ -656,6 +660,11 @@ pub fn runDaemon(allocator: std.mem.Allocator) !void {
         defer setDefault(allocator, id);
         serve(&app, server);
     } else serve(&app, server);
+    if (exit_signal != 0) {
+        std.debug.print("NearMic stopping on signal {d}\n", .{exit_signal});
+    } else {
+        std.debug.print("NearMic stopping: quit command\n", .{});
+    }
 }
 
 fn daemonListening(path: []const u8) bool {

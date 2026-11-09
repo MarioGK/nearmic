@@ -14,13 +14,14 @@
 
 #define RING 16384
 #define RING_MASK (RING - 1)
-/* Three graph quanta (64 ms) of silence at startup. The graph asks for up
-   to 1024 samples per cycle and the worker fills 256-sample hops, so an
-   empty ring turns the first short callback into an underrun and leaves no
-   margin for scheduler jitter. The worker also restores this reserve from
-   the single-writer side when an underrun does happen. */
-#define OUT_PREFILL 3072
-#define REFILL 3072
+/* The ring is the queue between the DSP worker and the playback callback, so
+   whatever it holds is added latency on the microphone the host sees. Keep
+   ~16 ms of reserve. The graph runs at 128 frames and the UAC2 ALSA periods
+   are 128, so this is six callbacks of slack: four was measurably too tight
+   under CFS on the RK3399. 64 ms (the original value) was long enough to be
+   audible as lag between talking and the host hearing it. */
+#define OUT_PREFILL 768
+#define REFILL 768
 
 struct Api {
     void (*pw_init)(int *, char ***);

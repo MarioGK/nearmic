@@ -339,6 +339,9 @@ independent; do not force a bit-perfect path or disable resampling. A 48 kHz
 graph (`default.clock.rate`) keeps the DSP hop at 48 kHz and avoids an extra
 conversion.
 
+The appliance ships the low-latency defaults instead of this optional block;
+see "Latency" below and `wireplumber/51-nearmic-latency.conf`.
+
 Optional low-latency tuning in
 `~/.config/pipewire/pipewire.conf.d/99-nearmic.conf`:
 
@@ -351,9 +354,48 @@ context.properties = {
 }
 ```
 
-Start at 256 or 512; if `pw-top` shows xruns, raise the quantum. NearMic's DSP
-hop is 256 samples (about 5.3 ms), so 256 is a natural graph quantum on a
-healthy RK3399.
+Start at 256 or 512; if `pw-top` shows xruns, raise the quantum.
+
+### Latency
+
+The appliance runs a 128-frame graph (2.7 ms) and does not use the optional
+block above:
+
+| Stage | Setting | Latency |
+| --- | --- | --- |
+| RNNoise | 480-sample frame, algorithmic | 10.0 ms |
+| NearMic output ring | servo target 768, cap 1536 frames | 16.0-32.0 ms |
+| PipeWire graph | `clock.force-quantum = 128` | 2.7 ms |
+| UAC2 ALSA | 128-frame periods | 2.7 ms granularity |
+| **Board total** | | **~29-45 ms** |
+
+`nearmic-default-sink` writes the quantum into PipeWire metadata on every
+NearMic start and `nearmic-health` puts it back after a PipeWire restart.
+
+Two things used to make the microphone feel like it "activated" late:
+
+1. **Suspend on idle.** WirePlumber closed the idle gadget and capture nodes
+   after a few seconds, so the first word after a quiet period had to survive a
+   node resume and a USB alternate-setting change. `51-nearmic-latency.conf`
+   sets `session.suspend-timeout-seconds = 0` and `node.pause-on-idle = false`.
+2. **A 64 ms output ring plus a 1024-frame graph.** The ring is the queue
+   between the DSP worker and the playback callback, so its fill is latency.
+   It now targets 768 frames: 512 was measurably too tight and underran about
+   every 5 s under CFS. The ALSA periods are 128 frames instead of 1024.
+
+On the host computer, `rockpi4/host/nearmic-host-keepalive.sh` (optional) keeps
+one silent consumer on the NearMic source, so the host never suspends the USB
+node either.
+
+### Errors are silent
+
+The Maono headphone amp turns a broken UAC2 stream (gadget reset, underrun,
+stalled graph, half-open link) into a loud high-pitched tone.
+`nearmic-headphone-link.sh` removes the links and mutes the Maono playback sink
+before it exits with an error, and `nearmic-health` unmutes it once the
+passthrough is genuinely linked again. The mute is recorded in
+`$XDG_RUNTIME_DIR/nearmic-maono-muted`, so a mute the operator set by hand is
+never touched.
 
 ## 6. systemd design
 
