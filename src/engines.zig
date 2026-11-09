@@ -163,7 +163,10 @@ pub const Slot = struct {
     }
 
     pub fn delaySamples(self: *const Slot) usize {
-        return self.adapter.delaySamples();
+        // The post chain's look-ahead limiter delays every neural engine by
+        // one DSP hop on top of the model's own delay.
+        const post_delay = if (self.post != null) voice.Post.latency else 0;
+        return self.adapter.delaySamples() + post_delay;
     }
 
     pub fn setGainDb(self: *Slot, db: f32) void {

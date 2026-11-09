@@ -32,27 +32,31 @@ The previous `dsp-dereverb` + `rock-pi-plus` ensemble had:
 ```
 Maono input 1
   -> RNNoise (learned full-band denoiser, 48 kHz)
-  -> voice.Post: 75 Hz HPF, low shelf -1 dB @250 Hz,
-                 +2 dB presence @3 kHz,
-                 gentle speech leveler (4:1 above -28 dBFS, up to +8 dB
-                 lift below it, scaled by presence over the tracked noise
-                 floor, 60 ms RMS, 10/300 ms, ramped per sample),
-                 -6 dB trim,
-                 soft limiter -1.5 dBFS
+  -> voice.Post: 90 Hz HPF, -2 dB low shelf @300 Hz,
+                 +4 dB peaking @3.2 kHz (Q 1.0), +2 dB shelf @8 kHz,
+                 speech leveler (4:1 above -24 dBFS, up to +12 dB lift
+                 below it, scaled by presence over the tracked noise floor,
+                 60 ms RMS, 10/300 ms, ramped per sample),
+                 +6 dB trim,
+                 look-ahead limiter -2.0 dBFS (256 samples of look-ahead)
   -> NearMic source `nearmic` (capture_MONO)
   -> UAC2 gadget playback_MONO
   -> host microphone
 ```
 
-The leveler is the far-field fix, and it is deliberately modest. A plain
-makeup gain would lift the noise floor by the same amount; an aggressive
-upward compressor sounds loud and gritty because it amplifies RNNoise's
-residual and applies a stepped gain per block. This one measures the level
-against a 15 s-rise noise floor, applies at most +8 dB while the signal is
-above it, ramps the gain per sample and trims -6 dB afterwards, so quiet
-speech moves closer without the chain getting louder. The +2 dB presence
-shelf restores the consonant edge that distance softens without the honk of
-a bigger shelf.
+The leveler is the far-field fix, and the limiter is what makes it loud
+without popping. A plain makeup gain would lift the noise floor by the same
+amount; this one measures the level against a 15 s-rise noise floor and only
+lifts while speech is present, so pauses stay at -60 dBFS. The look-ahead
+limiter knows the next block's peak before that block reaches the output, so
+it is already at the right gain when a loud syllable arrives: no overshoot,
+no flat-topped clipping, no "pop". That is what allows the +12 dB lift and
+the +6 dB trim instead of hiding 10 dB of headroom.
+
+The +4 dB presence peak at 3.2 kHz and the -2 dB shelf at 300 Hz are the
+"closeness" EQ: distance softens consonants and adds boxy low-mid, so the
+chain does the opposite. The 8 kHz shelf restores air without the 3 dB
+broadband sibilance a full high shelf produces.
 
 `src/app.zig` also runs a fractional ASRC with a proportional drift servo
 (target reserve 2048 samples, ratio 0.985–1.015) to absorb the USB clock

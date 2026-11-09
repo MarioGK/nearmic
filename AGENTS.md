@@ -186,16 +186,17 @@ cpu_budget = 0.80
   so the appliance pins `threads = 1` and `cpu_budget = 0.80`; the user allows
   up to 80 % CPU, but a heavier full-band model is not available on aarch64.
 - `engine = "rnnoise"` is the best full-band 48 kHz neural denoiser that builds
-  and runs on this board. `voice.Post` adds a 75 Hz high-pass, -1 dB low
-  shelf, +2 dB presence shelf, a gentle speech leveler and a soft limiter. The legacy
+  and runs on this board. `voice.Post` adds a 90 Hz high-pass, -2 dB low
+  shelf, +4 dB presence peak, +2 dB air shelf, a presence-gated speech
+  leveler and a 5.3 ms look-ahead limiter. The legacy
   `dsp`/`dsp-dereverb` engines remain selectable but are not the default. See
   [rockpi4/QUALITY.md](rockpi4/QUALITY.md).
-- `gain_db = 10` is the RNNoise makeup gain. `voice.Post` then runs a gentle
-  speech leveler: 4:1 compression above -28 dBFS, up to +8 dB of lift below
-  it (scaled by how far the level sits above the tracked noise floor), a
-  -6 dB output trim and per-sample gain ramping. Far-field speech therefore moves closer without the
-  chain getting louder or amplifying the noise RNNoise removed. Do not raise
-  `gain_db` to get far-field level; it only makes the leveler compress more.
+- `gain_db = 10` is the RNNoise makeup gain. `voice.Post` then runs a speech
+  leveler (4:1 above -24 dBFS, up to +12 dB of presence-gated lift below it,
+  per-sample gain ramping, +6 dB trim) and a look-ahead limiter at -2 dBFS.
+  The limiter's 256-sample look-ahead is why the chain can be loud without
+  the flat-topped "popping" of a reactive limiter. Do not raise `gain_db` to
+  get far-field level; the leveler normalises it.
 - `source` is the PipeWire `node.name` of the real microphone. Leaving it
   empty is racy on a headless boot; discover and set it explicitly.
 - `mode = "suppress"`, `listen = false`. Do not enable `listen` on the

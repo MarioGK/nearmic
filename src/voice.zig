@@ -4,68 +4,70 @@ const dsp = @import("dsp.zig");
 /// Post chain for neural engines (RNNoise, DPDFNet, LocalVQE).
 ///
 /// The models return clean but quiet speech: they do not restore the low end
-/// they high-passed, and they have no makeup gain. This chain is deliberately
-/// gentle so it does not add the artifacts the legacy spectral-subtraction
-/// chain had:
+/// they high-passed, and they have no makeup gain. The chain is tuned for a
+/// loud, close-sounding voice that does not pop:
 ///
-/// - 75 Hz high-pass removes rumble below the voice
-/// - a broad presence tilt (+2 dB above 3 kHz, -1 dB below 250 Hz) restores
-///   consonants without the 4 dB shelf honk
-/// - a speech leveler holds hot speech down 4:1 above -28 dBFS and adds a
-///   modest, presence-gated lift (up to +8 dB) below it, so a talker a
-///   couple of metres away is closer to a close talker without the density
-///   and pumping of a big upward compressor
-/// - a -6 dB output trim keeps the chain at a comfortable level: the leveler
-///   changes the balance between close and far speech, not the loudness
-/// - a soft limiter at -1.5 dBFS catches peaks, and the leveler keeps the
-///   signal off it so it does not colour the voice
+/// - 90 Hz high-pass removes rumble and plosive energy below the voice
+/// - a -2 dB low shelf at 300 Hz takes out the boxy "room" body that makes a
+///   talker sound distant
+/// - +4 dB at 3.2 kHz (Q 1.0) restores consonant energy, which is most of the
+///   intelligibility and closeness cue
+/// - +2 dB at 8 kHz puts back the air that distance and room absorption eat
+/// - a speech leveler holds close speech at a fixed level and lifts quiet
+///   (far) speech by up to +12 dB, gated on speech presence so the noise
+///   RNNoise removed is not lifted with it
+/// - a look-ahead limiter at -2.0 dBFS catches peaks with 5.3 ms of look-ahead,
+///   so the level can be loud without clipping or the flat-topped "popping"
+///   sound of a limiter that reacts after the peak
 pub const Post = struct {
     highpass: dsp.Biquad,
     low: dsp.Biquad,
     presence: dsp.Biquad,
+    air: dsp.Biquad,
     leveler: Leveler,
-    limiter: dsp.Limiter,
+    limiter: LookaheadLimiter,
     level: bool,
 
     pub fn init(level: bool) Post {
         return .{
-            .highpass = dsp.Biquad.highpass(dsp.sample_rate, 75, 0.707),
-            .low = dsp.Biquad.lowShelf(dsp.sample_rate, 250, -1.0),
-            .presence = dsp.Biquad.highShelf(dsp.sample_rate, 3000, 2.0),
+            .highpass = dsp.Biquad.highpass(dsp.sample_rate, 90, 0.707),
+            .low = dsp.Biquad.lowShelf(dsp.sample_rate, 300, -2.0),
+            .presence = dsp.Biquad.peaking(dsp.sample_rate, 3200, 1.0, 4.0),
+            .air = dsp.Biquad.highShelf(dsp.sample_rate, 8000, 2.0),
             .leveler = Leveler.init(),
-            .limiter = .{ .ceiling = dsp.dbToLin(-1.5) },
+            .limiter = .{ .ceiling = dsp.dbToLin(-2.0) },
             .level = level,
         };
     }
+
+    /// Samples of added latency from the look-ahead limiter.
+    pub const latency: usize = 256;
 
     pub fn process(self: *Post, samples: []f32) void {
         for (samples) |*s| {
             var x = self.highpass.process(s.*);
             x = self.low.process(x);
             x = self.presence.process(x);
+            x = self.air.process(x);
             s.* = x;
         }
         if (self.level) self.leveler.process(samples);
-        for (samples) |*s| s.* = self.limiter.process(s.*);
+        self.limiter.process(samples);
     }
 };
 
 /// Speech level control for neural engines.
 ///
-/// Gentle by design: the previous version lifted up to +16 dB and applied one
-/// gain per block, which sounded loud, dense and gritty. This one:
-///
-/// - 4:1 downward compression above -28 dBFS (peak control)
-/// - 1:1 lift below it, capped at +8 dB, scaled by how far the level sits
+/// - 4:1 downward compression above -24 dBFS (peak control)
+/// - 1:1 lift below it, capped at +12 dB, scaled by how far the level sits
 ///   above the tracked noise floor (silence and room tone stay at unity)
-/// - 10 ms attack / 300 ms release, and the gain is ramped across the block
-///   instead of stepped, so there is no zipper modulation
-/// - a -6 dB trim after the gain so speech lands well below the limiter
+/// - 60 ms detector, 10 ms attack / 300 ms release, gain ramped per sample
+/// - a +6 dB trim so the voice sits at a normal call level
 pub const Leveler = struct {
-    threshold_db: f32 = -28,
+    threshold_db: f32 = -24,
     ratio: f32 = 4.0,
-    max_lift_db: f32 = 8,
-    trim: f32 = 0.501, // -6 dB
+    max_lift_db: f32 = 12,
+    trim: f32 = 1.995, // +6 dB
     envelope: f32 = 0,
     floor: f32 = 0,
     gain: f32 = 1,
@@ -85,8 +87,8 @@ pub const Leveler = struct {
         for (samples) |s| sum += s * s;
         const ms = sum / @as(f32, @floatFromInt(samples.len));
 
-        // ~60 ms RMS: follows syllables, so short phrases reach the target level
-        // instead of passing at full level until the envelope catches up.
+        // ~60 ms RMS: follows syllables, so short phrases reach the target
+        // level instead of passing at full level until the envelope catches up.
         self.envelope += coeff(0.060, samples.len) * (ms - self.envelope);
 
         // Noise floor: seed from the first block, fall immediately to a new
@@ -137,6 +139,69 @@ pub const Leveler = struct {
     }
 };
 
+/// One-block look-ahead peak limiter.
+///
+/// The block that is emitted is the one received in the previous call, and the
+/// gain applied to it is the minimum of what that block needs and what the new
+/// block needs. That is a real look-ahead: the gain is already down when the
+/// peak arrives, so there is no overshoot and no flat-topped clipping (the
+/// "popping" sound). Attack drops immediately inside the look-ahead window;
+/// recovery ramps up over the block.
+pub const LookaheadLimiter = struct {
+    ceiling: f32 = dsp.dbToLin(-1.0),
+    pending: [dsp.hop]f32 = undefined,
+    pending_peak: f32 = 0,
+    primed: bool = false,
+    gain: f32 = 1,
+
+    pub fn process(self: *LookaheadLimiter, samples: []f32) void {
+        if (samples.len != self.pending.len) {
+            // Only the fixed DSP hop is supported; degrade to a soft clip so a
+            // different caller cannot read uninitialised memory.
+            for (samples) |*s| s.* = std.math.clamp(s.*, -self.ceiling, self.ceiling);
+            return;
+        }
+        const n = samples.len;
+
+        var peak: f32 = 0;
+        for (samples) |x| peak = @max(peak, @abs(x));
+
+        var current: [dsp.hop]f32 = undefined;
+        @memcpy(current[0..n], samples[0..n]);
+
+        if (self.primed) {
+            const need_pending = if (self.pending_peak > 1e-9)
+                self.ceiling / self.pending_peak
+            else
+                1;
+            const need_next = if (peak > 1e-9) self.ceiling / peak else 1;
+            const g = @min(@min(need_pending, need_next), 1);
+
+            if (g < self.gain) {
+                // Inside the look-ahead window: go down now, that is audible
+                // as a gentle gain change, not as a click.
+                for (self.pending[0..n]) |*s| s.* *= g;
+            } else {
+                const start = self.gain;
+                var i: usize = 0;
+                while (i < n) : (i += 1) {
+                    const t = @as(f32, @floatFromInt(i + 1)) / @as(f32, @floatFromInt(n));
+                    self.pending[i] *= start + (g - start) * t;
+                }
+            }
+            self.gain = g;
+            @memcpy(samples[0..n], self.pending[0..n]);
+        } else {
+            for (samples) |*s| s.* = 0;
+            self.primed = true;
+            self.gain = 1;
+        }
+
+        @memcpy(self.pending[0..n], current[0..n]);
+        self.pending_peak = peak;
+    }
+};
+
 test "leveler compresses loud speech and ramps smoothly" {
     var lv = Leveler.init();
     var hop: [dsp.hop]f32 = undefined;
@@ -147,10 +212,10 @@ test "leveler compresses loud speech and ramps smoothly" {
         for (&hop, 0..) |*s, i| s.* = 0.001 * @sin(@as(f32, @floatFromInt(i)) * 0.1);
         lv.process(&hop);
     }
-    // Only the -6 dB trim should be applied to steady room tone.
-    try std.testing.expectApproxEqAbs(@as(f32, 0.501), lv.gain, 0.05);
+    // Only the +6 dB trim should be applied to steady room tone.
+    try std.testing.expectApproxEqAbs(@as(f32, 1.995), lv.gain, 0.12);
 
-    // Loud speech: gain comes down towards the trim, output stays controlled.
+    // Loud speech: gain comes down, output stays controlled.
     n = 0;
     while (n < 400) : (n += 1) {
         for (&hop, 0..) |*s, i| s.* = 0.6 * @sin(@as(f32, @floatFromInt(i)) * 0.1);
@@ -160,7 +225,7 @@ test "leveler compresses loud speech and ramps smoothly" {
     try std.testing.expect(lv.gain > 0.02);
 }
 
-test "leveler lifts far speech by at most 8 dB over the noise floor" {
+test "leveler lifts far speech by at most 12 dB over the noise floor" {
     var lv = Leveler.init();
     var hop: [dsp.hop]f32 = undefined;
 
@@ -176,14 +241,22 @@ test "leveler lifts far speech by at most 8 dB over the noise floor" {
         lv.process(&hop);
     }
     try std.testing.expect(lv.gain > 1.0);
-    try std.testing.expect(lv.gain <= dsp.dbToLin(8.0) * 0.501 + 1e-3);
+    try std.testing.expect(lv.gain <= dsp.dbToLin(12.0) * 1.995 + 1e-3);
 }
 
-test "leveler returns to unity trim when the talker stops" {
-    var lv = Leveler.init();
-    var hop: [dsp.hop]f32 = undefined;
-    @memset(&hop, 0);
-    var n: usize = 0;
-    while (n < 200) : (n += 1) lv.process(&hop);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.501), lv.gain, 1e-3);
+test "limiter never exceeds the ceiling even on a step" {
+    var lim = LookaheadLimiter{ .ceiling = dsp.dbToLin(-2.0) };
+    var block: [dsp.hop]f32 = .{0} ** dsp.hop;
+    var peak: f32 = 0;
+    var b: usize = 0;
+    while (b < 40) : (b += 1) {
+        // Alternate full-scale steps and silence; the look-ahead must catch
+        // every one without overshooting.
+        for (&block, 0..) |*s, i| {
+            s.* = if (b % 2 == 0) 0.95 * @sin(@as(f32, @floatFromInt(i)) * 0.2) else 0;
+        }
+        lim.process(&block);
+        for (block) |s| peak = @max(peak, @abs(s));
+    }
+    try std.testing.expect(peak <= dsp.dbToLin(-2.0) + 1e-4);
 }

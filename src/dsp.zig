@@ -109,6 +109,27 @@ pub const Biquad = struct {
         };
     }
 
+    pub fn peaking(fs: f32, freq: f32, q: f32, gain_db: f32) Biquad {
+        const a = std.math.pow(f32, 10, gain_db / 40);
+        const w0 = 2 * std.math.pi * freq / fs;
+        const cosw = @cos(w0);
+        const sinw = @sin(w0);
+        const alpha = sinw / (2 * q);
+        const b0 = 1 + alpha * a;
+        const b1 = -2 * cosw;
+        const b2 = 1 - alpha * a;
+        const a0 = 1 + alpha / a;
+        const a1 = -2 * cosw;
+        const a2 = 1 - alpha / a;
+        return .{
+            .b0 = b0 / a0,
+            .b1 = b1 / a0,
+            .b2 = b2 / a0,
+            .a1 = a1 / a0,
+            .a2 = a2 / a0,
+        };
+    }
+
     pub fn lowShelf(fs: f32, freq: f32, gain_db: f32) Biquad {
         const a = std.math.pow(f32, 10, gain_db / 40);
         const w0 = 2 * std.math.pi * freq / fs;
