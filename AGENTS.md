@@ -327,10 +327,10 @@ not for the lowest CPU. Measured on the board:
 | Stage | Setting | Latency |
 | --- | --- | --- |
 | RNNoise | 480-sample frame (algorithmic) | 10.0 ms |
-| NearMic output ring | servo target/cap 768/1536 frames | 16.0-32.0 ms |
+| NearMic output ring | servo target/cap 1024/2048 frames, settles at ~75 % | 16.0-21.3 ms |
 | PipeWire graph | `clock.force-quantum = 128` frames | 2.7 ms |
 | UAC2 ALSA | 128-frame periods, 16 periods | 2.7 ms granularity |
-| **Board total** | | **~29-45 ms** |
+| **Board total** | | **~29-34 ms** |
 
 - `nearmic-default-sink` sets `clock.force-quantum 128` on every start and
   `nearmic-health` restores it after a PipeWire restart.

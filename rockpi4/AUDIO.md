@@ -364,10 +364,10 @@ block above:
 | Stage | Setting | Latency |
 | --- | --- | --- |
 | RNNoise | 480-sample frame, algorithmic | 10.0 ms |
-| NearMic output ring | servo target 768, cap 1536 frames | 16.0-32.0 ms |
+| NearMic output ring | servo target 1024, cap 2048 frames, settles at ~75 % | 16.0-21.3 ms |
 | PipeWire graph | `clock.force-quantum = 128` | 2.7 ms |
 | UAC2 ALSA | 128-frame periods | 2.7 ms granularity |
-| **Board total** | | **~29-45 ms** |
+| **Board total** | | **~29-34 ms** |
 
 `nearmic-default-sink` writes the quantum into PipeWire metadata on every
 NearMic start and `nearmic-health` puts it back after a PipeWire restart.
@@ -380,8 +380,9 @@ Two things used to make the microphone feel like it "activated" late:
    sets `session.suspend-timeout-seconds = 0` and `node.pause-on-idle = false`.
 2. **A 64 ms output ring plus a 1024-frame graph.** The ring is the queue
    between the DSP worker and the playback callback, so its fill is latency.
-   It now targets 768 frames: 512 was measurably too tight and underran about
-   every 5 s under CFS. The ALSA periods are 128 frames instead of 1024.
+   It now targets 1024 frames and settles around 768: 512 was measurably too
+   tight and underran about every 5 s under CFS. The ALSA periods are 128
+   frames instead of 1024.
 
 On the host computer, `rockpi4/host/nearmic-host-keepalive.sh` (optional) keeps
 one silent consumer on the NearMic source, so the host never suspends the USB

@@ -141,9 +141,9 @@ fn worker(app: *App) void {
     // Drift servo: the ring fill is the integral of the clock difference, so
     // a proportional ratio correction is a first-order loop with no overshoot.
     // Proportional drift servo on the output reserve. The reserve is latency:
-    // keep it near 16 ms. Measured deficit is 0.51%, which this loop still
+    // keep it near 21 ms; the servo settles around 75 % of target. Measured deficit is 0.51%, which this loop still
     // absorbs inside the 0.985-1.015 ratio clamp.
-    const target: f64 = 768;
+    const target: f64 = 1024;
     while (app.alive.load(.acquire)) {
         const refill = nm_out_take_refill();
         if (refill > 0) {
@@ -159,8 +159,8 @@ fn worker(app: *App) void {
             // absent (boot, replug, host not capturing). Otherwise the source
             // callback drains the reserve and every gap becomes an underrun.
             var level = nm_out_level();
-            while (level < 768) {
-                const n = @min(silence.len, 768 - level);
+            while (level < 1024) {
+                const n = @min(silence.len, 1024 - level);
                 _ = nm_out_write(&silence, @intCast(n));
                 level += n;
             }
@@ -173,7 +173,7 @@ fn worker(app: *App) void {
             resample.write(capture[0..got]);
         }
         var produced: usize = 0;
-        while (resample.canRead(block) and nm_out_level() < 1536 and produced < 8) {
+        while (resample.canRead(block) and nm_out_level() < 2048 and produced < 8) {
             const level: f64 = @floatFromInt(nm_out_level());
             const err = (level - target) / target;
             resample.ratio = std.math.clamp(1.0 + 0.02 * err, 0.985, 1.015);

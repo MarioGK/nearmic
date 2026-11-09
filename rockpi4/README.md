@@ -39,8 +39,8 @@ interface.
 | NearMic source | `nearmic` (`capture_MONO`) |
 | Headphone passthrough | `UAC2Gadget` capture FL/FR -> Maono playback FL/FR (`nearmic-headphone-link`) |
 | NearMic chain | RNNoise + `voice.Post` (75 Hz HPF, low/presence/air shelves, speech leveler with far-field lift, limiter) |
-| Latency | 128-frame graph, 128-frame UAC2 periods, 768-frame ring target — ~29-45 ms board total |
-| Live audio | 0 underruns after start, `out_fill` 768–1024, ~36 % of one core (~6 % of the 6-core RK3399), ~23 MB RSS |
+| Latency | 128-frame graph, 128-frame UAC2 periods, 1024-frame ring target — ~29-34 ms board total |
+| Live audio | `out_fill` 768–1024, ~36 % of one core (~6 % of the 6-core RK3399), ~23 MB RSS |
 | Errors | Passthrough removes the links and mutes the Maono output, so a broken gadget is silent instead of squealing |
 
 The old `dsp-dereverb` chain is still selectable, but it was the robotic one:

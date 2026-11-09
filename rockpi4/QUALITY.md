@@ -65,11 +65,12 @@ difference between the Maono capture and the UAC2 gadget.
 Live board:
 
 - `engine=rnnoise`, `gain_db=10`, `threads=1`, `cpu_budget=0.80`
-- `underruns=0` after start; `out_fill=768–1024` (16-21 ms of ring)
+- `out_fill=768–1024` (16-21 ms of ring); a startup burst of a few
+  128-sample underruns, then ~1 per 10 s of a single period (inaudible)
 - 128-frame graph (`clock.force-quantum=128`), 128-frame UAC2 ALSA periods
 - ~36 % of one core = ~6 % of the 6-core RK3399; ~23 MB RSS
 - `nearmic qa`: p99 0.90 ms per 5.33 ms block, about 6x faster than realtime
-- board latency budget ~29-45 ms end to end, measured from the ring fill,
+- board latency budget ~29-34 ms end to end, measured from the ring fill,
   graph quantum and the 480-sample RNNoise frame
 - `qa`: `rock-pi-plus`, p99 ~1.38 ms per 5.33 ms hop
 
