@@ -9,19 +9,20 @@ const dsp = @import("dsp.zig");
 /// chain had:
 ///
 /// - 75 Hz high-pass removes rumble below the voice
-/// - a broad presence tilt (+3 dB above 3 kHz, -1 dB below 250 Hz) restores
-///   consonants without the 4 dB shelf honk; a +1.5 dB air shelf at 7 kHz
-///   gives back the top octave that far-field speech loses to the room
-/// - a speech leveler holds loud speech near -18 dBFS and lifts quiet
-///   (far-field) speech by up to +16 dB, so a talker one or two metres away
-///   sits at the same level as a close talker. It is a compressor on the
-///   RNNoise output, so it lifts voice, not the room tone RNNoise removed
-/// - a soft limiter at -1.5 dBFS catches the lift on peaks
+/// - a broad presence tilt (+2 dB above 3 kHz, -1 dB below 250 Hz) restores
+///   consonants without the 4 dB shelf honk
+/// - a speech leveler holds hot speech down 4:1 above -28 dBFS and adds a
+///   modest, presence-gated lift (up to +8 dB) below it, so a talker a
+///   couple of metres away is closer to a close talker without the density
+///   and pumping of a big upward compressor
+/// - a -6 dB output trim keeps the chain at a comfortable level: the leveler
+///   changes the balance between close and far speech, not the loudness
+/// - a soft limiter at -1.5 dBFS catches peaks, and the leveler keeps the
+///   signal off it so it does not colour the voice
 pub const Post = struct {
     highpass: dsp.Biquad,
     low: dsp.Biquad,
     presence: dsp.Biquad,
-    air: dsp.Biquad,
     leveler: Leveler,
     limiter: dsp.Limiter,
     level: bool,
@@ -30,8 +31,7 @@ pub const Post = struct {
         return .{
             .highpass = dsp.Biquad.highpass(dsp.sample_rate, 75, 0.707),
             .low = dsp.Biquad.lowShelf(dsp.sample_rate, 250, -1.0),
-            .presence = dsp.Biquad.highShelf(dsp.sample_rate, 3000, 3.0),
-            .air = dsp.Biquad.highShelf(dsp.sample_rate, 7000, 1.5),
+            .presence = dsp.Biquad.highShelf(dsp.sample_rate, 3000, 2.0),
             .leveler = Leveler.init(),
             .limiter = .{ .ceiling = dsp.dbToLin(-1.5) },
             .level = level,
@@ -43,7 +43,6 @@ pub const Post = struct {
             var x = self.highpass.process(s.*);
             x = self.low.process(x);
             x = self.presence.process(x);
-            x = self.air.process(x);
             s.* = x;
         }
         if (self.level) self.leveler.process(samples);
@@ -51,26 +50,22 @@ pub const Post = struct {
     }
 };
 
-/// Speech level control for neural engines: a compressor around -18 dBFS
-/// with up to +16 dB of lift below it, gated on speech presence.
+/// Speech level control for neural engines.
 ///
-/// A fixed makeup gain cannot make a far-field talker sound close without also
-/// lifting the residual noise. This stage estimates an ~80 ms RMS, tracks the
-/// noise floor under it, and maps the level onto a static curve:
+/// Gentle by design: the previous version lifted up to +16 dB and applied one
+/// gain per block, which sounded loud, dense and gritty. This one:
 ///
-///   level > -18 dBFS   ->  3:1 downward compression (peak control)
-///   level < -18 dBFS   ->  1:1 lift, capped at +16 dB
-///
-/// The lift is scaled by how far the current level sits above the tracked
-/// noise floor: silence and room tone stay at unity, so RNNoise's residual is
-/// not amplified, while speech several dB above the floor gets the full lift.
-/// The gain moves with a 15 ms attack and a 150 ms release. The old AGC
-/// pumped because it gated on speech and lifted room tone everywhere; this one
-/// only ever moves a few dB per syllable.
+/// - 4:1 downward compression above -28 dBFS (peak control)
+/// - 1:1 lift below it, capped at +8 dB, scaled by how far the level sits
+///   above the tracked noise floor (silence and room tone stay at unity)
+/// - 10 ms attack / 300 ms release, and the gain is ramped across the block
+///   instead of stepped, so there is no zipper modulation
+/// - a -6 dB trim after the gain so speech lands well below the limiter
 pub const Leveler = struct {
-    threshold_db: f32 = -18,
-    ratio: f32 = 3.0,
-    max_lift_db: f32 = 16,
+    threshold_db: f32 = -28,
+    ratio: f32 = 4.0,
+    max_lift_db: f32 = 8,
+    trim: f32 = 0.501, // -6 dB
     envelope: f32 = 0,
     floor: f32 = 0,
     gain: f32 = 1,
@@ -90,13 +85,13 @@ pub const Leveler = struct {
         for (samples) |s| sum += s * s;
         const ms = sum / @as(f32, @floatFromInt(samples.len));
 
-        // ~80 ms RMS: fast enough to follow a phrase, slow enough to ignore
-        // individual cycles.
-        self.envelope += coeff(0.080, samples.len) * (ms - self.envelope);
+        // ~60 ms RMS: follows syllables, so short phrases reach the target level
+        // instead of passing at full level until the envelope catches up.
+        self.envelope += coeff(0.060, samples.len) * (ms - self.envelope);
 
-        // Noise floor: seed from the first block, then fall immediately to a
-        // new minimum and rise over ~15 s. A slow rise keeps a sustained
-        // talker from being absorbed into the floor.
+        // Noise floor: seed from the first block, fall immediately to a new
+        // minimum, rise over ~15 s. A slow rise keeps a sustained talker from
+        // being absorbed into the floor.
         if (self.floor <= 1e-12) {
             self.floor = ms;
         } else if (ms < self.floor) {
@@ -114,27 +109,35 @@ pub const Leveler = struct {
         }
 
         const level = @sqrt(self.envelope);
-        var desired: f32 = 1;
+        var desired: f32 = self.trim;
         if (level > 1e-9) {
             const level_db = 20 * std.math.log10(level);
             const gain_db = if (level_db > self.threshold_db)
                 (self.threshold_db - level_db) * (1 - 1 / self.ratio)
             else
                 @min(self.max_lift_db, self.threshold_db - level_db) * presence;
-            desired = dsp.dbToLin(gain_db);
+            desired = dsp.dbToLin(gain_db) * self.trim;
         }
 
-        // Attack when the gain has to come down, release when it can go up.
         const rate = if (desired < self.gain)
-            coeff(0.015, samples.len)
+            coeff(0.010, samples.len)
         else
-            coeff(0.150, samples.len);
+            coeff(0.300, samples.len);
+
+        // Ramp the gain across the block: a constant per-block gain steps at
+        // 187 Hz and is audible as a rough edge on speech.
+        const start = self.gain;
         self.gain += rate * (desired - self.gain);
-        for (samples) |*s| s.* *= self.gain;
+        const end = self.gain;
+        const n = @as(f32, @floatFromInt(samples.len));
+        for (samples, 0..) |*s, i| {
+            const t = @as(f32, @floatFromInt(i + 1)) / n;
+            s.* *= start + (end - start) * t;
+        }
     }
 };
 
-test "leveler compresses loud speech without lifting silence" {
+test "leveler compresses loud speech and ramps smoothly" {
     var lv = Leveler.init();
     var hop: [dsp.hop]f32 = undefined;
 
@@ -144,19 +147,20 @@ test "leveler compresses loud speech without lifting silence" {
         for (&hop, 0..) |*s, i| s.* = 0.001 * @sin(@as(f32, @floatFromInt(i)) * 0.1);
         lv.process(&hop);
     }
-    try std.testing.expect(lv.gain < 1.2);
+    // Only the -6 dB trim should be applied to steady room tone.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.501), lv.gain, 0.05);
 
-    // Loud speech: gain comes down and the output stays below the input.
+    // Loud speech: gain comes down towards the trim, output stays controlled.
     n = 0;
     while (n < 400) : (n += 1) {
         for (&hop, 0..) |*s, i| s.* = 0.6 * @sin(@as(f32, @floatFromInt(i)) * 0.1);
         lv.process(&hop);
     }
-    try std.testing.expect(lv.gain < 0.6);
-    try std.testing.expect(lv.gain > 0.05);
+    try std.testing.expect(lv.gain < 0.5);
+    try std.testing.expect(lv.gain > 0.02);
 }
 
-test "leveler lifts far speech above the tracked noise floor" {
+test "leveler lifts far speech by at most 8 dB over the noise floor" {
     var lv = Leveler.init();
     var hop: [dsp.hop]f32 = undefined;
 
@@ -166,21 +170,20 @@ test "leveler lifts far speech above the tracked noise floor" {
         lv.process(&hop);
     }
 
-    // A talker roughly 30 dB below close speech: quiet but clearly present.
     n = 0;
     while (n < 800) : (n += 1) {
         for (&hop, 0..) |*s, i| s.* = 0.02 * @sin(@as(f32, @floatFromInt(i)) * 0.1);
         lv.process(&hop);
     }
-    try std.testing.expect(lv.gain > 2.0);
-    try std.testing.expect(lv.gain <= dsp.dbToLin(16.0) + 1e-3);
+    try std.testing.expect(lv.gain > 1.0);
+    try std.testing.expect(lv.gain <= dsp.dbToLin(8.0) * 0.501 + 1e-3);
 }
 
-test "leveler returns to unity when the talker stops" {
+test "leveler returns to unity trim when the talker stops" {
     var lv = Leveler.init();
     var hop: [dsp.hop]f32 = undefined;
     @memset(&hop, 0);
     var n: usize = 0;
     while (n < 200) : (n += 1) lv.process(&hop);
-    try std.testing.expectApproxEqAbs(@as(f32, 1), lv.gain, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.501), lv.gain, 1e-3);
 }

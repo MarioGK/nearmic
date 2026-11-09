@@ -33,21 +33,26 @@ The previous `dsp-dereverb` + `rock-pi-plus` ensemble had:
 Maono input 1
   -> RNNoise (learned full-band denoiser, 48 kHz)
   -> voice.Post: 75 Hz HPF, low shelf -1 dB @250 Hz,
-                 +3 dB presence @3 kHz, +1.5 dB air @7 kHz,
-                 speech leveler (3:1 above -18 dBFS, up to +16 dB lift
-                 below it, scaled by presence over the tracked noise
-                 floor), soft limiter -1.5 dBFS
+                 +2 dB presence @3 kHz,
+                 gentle speech leveler (4:1 above -28 dBFS, up to +8 dB
+                 lift below it, scaled by presence over the tracked noise
+                 floor, 60 ms RMS, 10/300 ms, ramped per sample),
+                 -6 dB trim,
+                 soft limiter -1.5 dBFS
   -> NearMic source `nearmic` (capture_MONO)
   -> UAC2 gadget playback_MONO
   -> host microphone
 ```
 
-The leveler is the far-field fix. A plain makeup gain would have to lift the
-noise floor by the same 6-16 dB; this one measures the level against a
-15 s-rise noise floor and only applies lift while the signal is above it, so
-quiet speech arrives at the same loudness as close speech and pauses stay
-quiet. Presence and air shelves restore the high end that distance and room
-absorption remove, which is most of the "sounds far away" cue.
+The leveler is the far-field fix, and it is deliberately modest. A plain
+makeup gain would lift the noise floor by the same amount; an aggressive
+upward compressor sounds loud and gritty because it amplifies RNNoise's
+residual and applies a stepped gain per block. This one measures the level
+against a 15 s-rise noise floor, applies at most +8 dB while the signal is
+above it, ramps the gain per sample and trims -6 dB afterwards, so quiet
+speech moves closer without the chain getting louder. The +2 dB presence
+shelf restores the consonant edge that distance softens without the honk of
+a bigger shelf.
 
 `src/app.zig` also runs a fractional ASRC with a proportional drift servo
 (target reserve 2048 samples, ratio 0.985–1.015) to absorb the USB clock
