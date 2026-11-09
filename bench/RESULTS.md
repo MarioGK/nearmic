@@ -10,10 +10,10 @@ Raw impulse tail ratio: 0.333
 
 | engine | pass | cpu | x realtime | p99 ms | block ms | delay ms | speech in | speech out | loudness error | pause in | pause out | tail ratio |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| leveler | no | 0.0001 | 945 | 0.006 | 5.333 | 0.00 | -28.9 | -19.4 | 1.4 | -42.1 | -31.8 | 0.333 |
-| dsp | no | 0.0003 | 605 | 0.009 | 5.333 | 5.33 | -28.9 | -19.2 | 1.2 | -42.1 | -35.9 | 0.120 |
-| dsp-dereverb | yes | 0.0003 | 578 | 0.009 | 5.333 | 5.33 | -28.9 | -20.3 | 2.3 | -42.1 | -41.0 | 0.072 |
-| speex-dereverb | no | 0.0007 | 325 | 0.246 | 80.000 | 10.00 | -28.9 | -19.5 | 1.5 | -42.1 | -32.6 | 0.327 |
+| leveler | no | 0.0001 | 1423 | 0.004 | 5.333 | 0.00 | -28.9 | -19.4 | 1.4 | -42.1 | -31.8 | 0.333 |
+| dsp | no | 0.0003 | 588 | 0.009 | 5.333 | 5.33 | -28.9 | -19.2 | 1.2 | -42.1 | -35.9 | 0.120 |
+| dsp-dereverb | yes | 0.0003 | 428 | 0.012 | 5.333 | 5.33 | -28.9 | -20.3 | 2.3 | -42.1 | -41.0 | 0.072 |
+| speex-dereverb | no | 0.0007 | 316 | 0.254 | 80.000 | 10.00 | -28.9 | -19.4 | 1.4 | -42.1 | -32.6 | 0.327 |
 
 Winner: **dsp-dereverb**
 
@@ -21,5 +21,5 @@ Best passing tail ratio 0.072 against raw 0.333. The room score counts, because 
 
 ## Not in this binary
 
-- RNNoise current weights are a generated 78 MB C file downloaded at build time. It was left out of the single binary so the release stays one small file. The classical denoise above is the lightweight stand-in.
-- LocalVQE, DPDFNet, and ClearerVoice are reference designs. ClearerVoice's published models decode in 1 to 10 second windows and want CUDA, so they miss the live gates without a separate measurement. LocalVQE and DPDFNet are not linked here; see bench/EXTERNAL.md for the build attempt.
+- RNNoise, LocalVQE, and DPDFNet were run on this same fixture. The rows, including DPDFNet's measured realtime factor, are in bench/AI.md. None of those models pass the gates at their native level. A fixed makeup gain makes DPDFNet pass on this clip; that gain is not what the binary ships.
+- ClearerVoice-Studio was run on CPU PyTorch. FRCRN and MossFormerGAN were slower than the audio. The rows are in bench/AI.md. It is not linked here.

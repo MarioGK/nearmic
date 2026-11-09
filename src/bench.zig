@@ -439,7 +439,146 @@ pub fn run(allocator: std.mem.Allocator, writer: anytype) ![]const u8 {
         });
     }
     try writer.print("\n## Not in this binary\n\n", .{});
-    try writer.print("- RNNoise current weights are a generated 78 MB C file downloaded at build time. It was left out of the single binary so the release stays one small file. The classical denoise above is the lightweight stand-in.\n", .{});
-    try writer.print("- LocalVQE, DPDFNet, and ClearerVoice are reference designs. ClearerVoice's published models decode in 1 to 10 second windows and want CUDA, so they miss the live gates without a separate measurement. LocalVQE and DPDFNet are not linked here; see bench/EXTERNAL.md for the build attempt.\n", .{});
+    try writer.print("- RNNoise, LocalVQE, and DPDFNet were run on this same fixture. The rows, including DPDFNet's measured realtime factor, are in bench/AI.md. None of those models pass the gates at their native level. A fixed makeup gain makes DPDFNet pass on this clip; that gain is not what the binary ships.\n", .{});
+    try writer.print("- ClearerVoice-Studio was run on CPU PyTorch. FRCRN and MossFormerGAN were slower than the audio. The rows are in bench/AI.md. It is not linked here.\n", .{});
     return winner;
+}
+
+fn writeF32(path: []const u8, samples: []const f32) !void {
+    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    var bytes = std.ArrayList(u8).init(std.heap.page_allocator);
+    defer bytes.deinit();
+    try bytes.resize(samples.len * 4);
+    for (samples, 0..) |s, i| {
+        std.mem.writeInt(u32, bytes.items[i * 4 ..][0..4], @bitCast(s), .little);
+    }
+    try file.writeAll(bytes.items);
+}
+
+fn readF32(allocator: std.mem.Allocator, path: []const u8) ![]f32 {
+    const data = try std.fs.cwd().readFileAlloc(allocator, path, 64 * 1024 * 1024);
+    defer allocator.free(data);
+    if (data.len % 4 != 0) return error.BadPcm;
+    const out = try allocator.alloc(f32, data.len / 4);
+    for (out, 0..) |*s, i| s.* = @bitCast(std.mem.readInt(u32, data[i * 4 ..][0..4], .little));
+    return out;
+}
+
+pub fn writeFixture(allocator: std.mem.Allocator, dir: []const u8) !void {
+    try std.fs.cwd().makePath(dir);
+    var far = try makeFarMic(allocator);
+    defer far.deinit();
+    const impulse = try makeImpulse(allocator);
+    defer allocator.free(impulse);
+    var path_buf: [512]u8 = undefined;
+    try writeF32(try std.fmt.bufPrint(&path_buf, "{s}/far48.f32", .{dir}), far.samples);
+    try writeF32(try std.fmt.bufPrint(&path_buf, "{s}/impulse48.f32", .{dir}), impulse);
+
+    var rs = dsp.Resampler3.init();
+    const far16 = try allocator.alloc(f32, far.samples.len / 3 + 8);
+    defer allocator.free(far16);
+    const nfar = rs.decimate(far.samples, far16);
+    try writeF32(try std.fmt.bufPrint(&path_buf, "{s}/far16.f32", .{dir}), far16[0..nfar]);
+    rs = dsp.Resampler3.init();
+    const imp16 = try allocator.alloc(f32, impulse.len / 3 + 8);
+    defer allocator.free(imp16);
+    const nimp = rs.decimate(impulse, imp16);
+    try writeF32(try std.fmt.bufPrint(&path_buf, "{s}/impulse16.f32", .{dir}), imp16[0..nimp]);
+}
+
+fn upsample3(allocator: std.mem.Allocator, input: []const f32) ![]f32 {
+    var rs = dsp.Resampler3.init();
+    const out = try allocator.alloc(f32, input.len * 3 + 16);
+    const n = rs.interpolate(input, out);
+    return allocator.realloc(out, n);
+}
+
+fn peakDelay(samples: []const f32) usize {
+    var best: usize = 0;
+    var mag: f32 = 0;
+    for (samples, 0..) |s, i| {
+        const a = @abs(s);
+        if (a > mag) {
+            mag = a;
+            best = i;
+        }
+    }
+    return best;
+}
+
+pub fn scoreExternal(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    name: []const u8,
+    cpu_seconds: f64,
+    p99_ns: u64,
+    block: usize,
+    rate: f64,
+    audio_samples: usize,
+    level: bool,
+    far_path: []const u8,
+    impulse_path: []const u8,
+) !void {
+    var far = try makeFarMic(allocator);
+    defer far.deinit();
+    const raw_impulse = try makeImpulse(allocator);
+    defer allocator.free(raw_impulse);
+    const raw_tail = tailRatio(raw_impulse, 0);
+
+    var far_out = try readF32(allocator, far_path);
+    defer allocator.free(far_out);
+    var impulse_out = try readF32(allocator, impulse_path);
+    defer allocator.free(impulse_out);
+    if (rate < 20000) {
+        const up_far = try upsample3(allocator, far_out);
+        allocator.free(far_out);
+        far_out = up_far;
+        const up_imp = try upsample3(allocator, impulse_out);
+        allocator.free(impulse_out);
+        impulse_out = up_imp;
+    }
+    const delay = peakDelay(impulse_out);
+    const tail = tailRatio(impulse_out, delay);
+
+    var leveled: []f32 = far_out;
+    var owned_level = false;
+    if (level) {
+        const n = far_out.len - (far_out.len % dsp.hop);
+        leveled = try allocator.alloc(f32, n);
+        owned_level = true;
+        var chain = dsp.Chain.init(false, false);
+        chain.process(far_out[0..n], leveled);
+    }
+    defer if (owned_level) allocator.free(leveled);
+
+    const skip: usize = 48000 / 2;
+    const speech_db = dbOf(maskedRms(leveled, far.speech, 1, skip, delay));
+    const pause_out_db = dbOf(maskedRms(leveled, far.speech, 0, skip, delay));
+    const speech_in_db = dbOf(maskedRms(far.samples, far.speech, 1, skip, 0));
+    const pause_in_db = dbOf(maskedRms(far.samples, far.speech, 0, skip, 0));
+    const audio_seconds = @as(f64, @floatFromInt(audio_samples)) / rate;
+    const cores: f64 = @floatFromInt(try std.Thread.getCpuCount());
+    const cpu = cpu_seconds / audio_seconds / cores;
+    const p99_ms = @as(f64, @floatFromInt(p99_ns)) / 1e6;
+    const block_ms = @as(f64, @floatFromInt(block)) / rate * 1000.0;
+    const loud_err = @abs(speech_db - dsp.target_db);
+    const pass = p99_ms < block_ms and cpu <= 0.05 and speech_db > -36 and loud_err <= 8 and (pause_out_db < -42 or pause_out_db <= pause_in_db + 6);
+    const times = if (p99_ms > 0) block_ms / p99_ms else 0;
+    try writer.print("| {s} | {s} | {d:.4} | {d:.0} | {d:.3} | {d:.3} | {d:.2} | {d:.1} | {d:.1} | {d:.1} | {d:.1} | {d:.1} | {d:.3} |\n", .{
+        name,
+        if (pass) "yes" else "no",
+        cpu,
+        times,
+        p99_ms,
+        block_ms,
+        @as(f64, @floatFromInt(delay)) / 48.0,
+        speech_in_db,
+        speech_db,
+        loud_err,
+        pause_in_db,
+        pause_out_db,
+        tail,
+    });
+    try writer.print("raw_tail={d:.3} measured_delay_samples={d}\n", .{ raw_tail, delay });
 }

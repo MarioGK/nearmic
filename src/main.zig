@@ -11,6 +11,8 @@ fn usage() void {
         \\  nearmic enhance in.wav out.wav
         \\  nearmic bench               print the bake-off
         \\  nearmic bakeoff --write bench/RESULTS.md
+        \\  nearmic fixture DIR         write the shared far-mic files
+        \\  nearmic score NAME CPU_S P99_NS BLOCK RATE AUDIO_SAMPLES far.f32 impulse.f32 [--level]
         \\  nearmic doctor
         \\  nearmic status
         \\  nearmic mode suppress|bypass|mute
@@ -58,6 +60,23 @@ pub fn main() !void {
             std.debug.print("measured winner is {s}; this binary ships {s}\n", .{ shown, app.engineName() });
             std.process.exit(1);
         }
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "fixture")) {
+        if (args.len != 3) return usage();
+        try bench.writeFixture(allocator, args[2]);
+        std.debug.print("wrote fixture in {s}\n", .{args[2]});
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "score")) {
+        if (args.len != 10 and args.len != 11) return usage();
+        const level = args.len == 11 and std.mem.eql(u8, args[10], "--level");
+        const cpu_s = try std.fmt.parseFloat(f64, args[3]);
+        const p99_ns = try std.fmt.parseInt(u64, args[4], 10);
+        const block = try std.fmt.parseInt(usize, args[5], 10);
+        const rate = try std.fmt.parseFloat(f64, args[6]);
+        const audio_samples = try std.fmt.parseInt(usize, args[7], 10);
+        try bench.scoreExternal(allocator, std.io.getStdOut().writer(), args[2], cpu_s, p99_ns, block, rate, audio_samples, level, args[8], args[9]);
         return;
     }
     if (std.mem.eql(u8, args[1], "doctor")) {
