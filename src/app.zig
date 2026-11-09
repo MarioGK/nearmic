@@ -1,4 +1,5 @@
 const std = @import("std");
+const accel = @import("accel.zig");
 const dsp = @import("dsp.zig");
 const wav = @import("wav.zig");
 const config = @import("config.zig");
@@ -50,6 +51,11 @@ const App = struct {
     noted_len: usize = 0,
     failed_engine: [64]u8 = .{0} ** 64,
     failed_len: usize = 0,
+    profile: config.Profile = .desktop,
+    thread_request: u32 = 1,
+    cpu_budget: f32 = 0.05,
+    threads_explicit: bool = false,
+    budget_explicit: bool = false,
 };
 
 var global_app: ?*App = null;
@@ -84,6 +90,33 @@ fn applyBypass(app: *App, input: []const f32, output: []f32) void {
     app.delay_pos = (app.delay_pos + input.len) % app.delay_buf.len;
 }
 
+fn openOpts(app: *const App) engines.OpenOptions {
+    return .{
+        .profile = app.profile,
+        .threads = app.thread_request,
+        .cpu_budget = app.cpu_budget,
+    };
+}
+
+fn rememberRuntime(app: *App, cfg: config.Config) void {
+    app.profile = cfg.profile;
+    app.thread_request = cfg.effectiveThreads();
+    app.cpu_budget = cfg.effectiveBudget();
+    app.threads_explicit = cfg.threads_explicit;
+    app.budget_explicit = cfg.budget_explicit;
+}
+
+fn runtimeChanged(app: *const App, cfg: config.Config) bool {
+    if (app.profile != cfg.profile) return true;
+    if (app.thread_request != cfg.effectiveThreads()) return true;
+    if (app.threads_explicit != cfg.threads_explicit) return true;
+    if (app.budget_explicit != cfg.budget_explicit) return true;
+    if (@abs(app.cpu_budget - cfg.effectiveBudget()) > 0.0001) return true;
+    return false;
+}
+
+/// DSP runs here, on this worker and on the rock profile's pool. The PipeWire
+/// callback only copies samples into the ring.
 fn worker(app: *App) void {
     const block = dsp.hop;
     var input: [dsp.hop]f32 = undefined;
@@ -120,7 +153,7 @@ fn worker(app: *App) void {
 
 fn statusText(allocator: std.mem.Allocator, app: *App) ![]u8 {
     const mode: Mode = @enumFromInt(app.mode.load(.acquire));
-    return std.fmt.allocPrint(allocator, "engine={s}\ngain_db={d}\nmode={s}\nlisten={s}\nstreaming={d}\ndelay_samples={d}\nunderruns={d}\nsource={s}\nshipped={s}\n", .{
+    return std.fmt.allocPrint(allocator, "engine={s}\ngain_db={d}\nmode={s}\nlisten={s}\nstreaming={d}\ndelay_samples={d}\nunderruns={d}\nsource={s}\nshipped={s}\nprofile={s}\nthreads={d}\ncpu_budget={d:.2}\nsimd={s}\nnpu_invoked=no\n", .{
         app.slot.name,
         app.gain_db,
         @tagName(mode),
@@ -130,6 +163,10 @@ fn statusText(allocator: std.mem.Allocator, app: *App) ![]u8 {
         nm_underruns(),
         app.source_name[0..app.source_len],
         engineName(),
+        config.profileName(app.profile),
+        app.slot.threadsUsed(),
+        app.cpu_budget,
+        dsp.compiledSimd(),
     });
 }
 
@@ -147,7 +184,7 @@ fn swapEngine(app: *App, name: []const u8) bool {
         std.debug.print("engine {s}: {s}\n", .{ name, avail.reason });
         return false;
     }
-    const opened = engines.open(app.allocator, name) catch |err| {
+    const opened = engines.open(app.allocator, name, openOpts(app)) catch |err| {
         std.debug.print("engine {s}: {s}\n", .{ name, @errorName(err) });
         return false;
     };
@@ -234,14 +271,38 @@ fn applyHot(app: *App, cfg: config.Config) void {
         app.slot.setGainDb(cfg.gain_db);
         app.mu.unlock();
     }
-    if (!std.mem.eql(u8, cfg.engine, app.slot.name)) {
+    const runtime = runtimeChanged(app, cfg);
+    const engine_changed = !std.mem.eql(u8, cfg.engine, app.slot.name);
+    const saved_profile = app.profile;
+    const saved_threads = app.thread_request;
+    const saved_budget = app.cpu_budget;
+    const saved_threads_explicit = app.threads_explicit;
+    const saved_budget_explicit = app.budget_explicit;
+    if (runtime) rememberRuntime(app, cfg);
+    if (engine_changed or runtime) {
         const avail = engines.availability(cfg.engine);
-        if (!avail.ok) {
-            if (rememberFailure(app, cfg.engine)) std.debug.print("engine {s}: {s}\n", .{ cfg.engine, avail.reason });
-        } else if (!swapEngine(app, cfg.engine)) {
-            if (rememberFailure(app, cfg.engine)) std.debug.print("engine {s} failed to start\n", .{cfg.engine});
+        const started = avail.ok and swapEngine(app, cfg.engine);
+        if (!started) {
+            app.profile = saved_profile;
+            app.thread_request = saved_threads;
+            app.cpu_budget = saved_budget;
+            app.threads_explicit = saved_threads_explicit;
+            app.budget_explicit = saved_budget_explicit;
+            if (rememberFailure(app, cfg.engine)) {
+                if (!avail.ok) {
+                    std.debug.print("engine {s}: {s}\n", .{ cfg.engine, avail.reason });
+                } else {
+                    std.debug.print("engine {s} failed to start\n", .{cfg.engine});
+                }
+            }
         } else {
-            std.debug.print("engine={s} delay_samples={d}\n", .{ app.slot.name, app.slot.delaySamples() });
+            std.debug.print("engine={s} profile={s} threads={d} cpu_budget={d:.2} delay_samples={d}\n", .{
+                app.slot.name,
+                config.profileName(app.profile),
+                app.slot.threadsUsed(),
+                app.cpu_budget,
+                app.slot.delaySamples(),
+            });
         }
     }
     const running = app.source_name[0..app.source_len];
@@ -271,6 +332,11 @@ fn maybeReload(app: *App) void {
         .listen = app.listen.load(.acquire),
         .engine = engine_copy,
         .gain_db = app.gain_db,
+        .profile = app.profile,
+        .threads = app.thread_request,
+        .cpu_budget = app.cpu_budget,
+        .threads_explicit = app.threads_explicit,
+        .budget_explicit = app.budget_explicit,
         .allocator = app.allocator,
     };
     const loaded = config.loadKeeping(app.allocator, &prev, text) catch |err| {
@@ -441,18 +507,20 @@ pub fn runDaemon(allocator: std.mem.Allocator) !void {
     defer cfg.deinit();
     const home = std.posix.getenv("HOME") orelse "/tmp";
     const config_path = try config.configPath(allocator, home);
-    var slot = engines.open(allocator, cfg.engine) catch blk: {
-        const avail = engines.availability(cfg.engine);
-        std.debug.print("engine {s}: {s}\nfalling back to dsp-dereverb\n", .{ cfg.engine, avail.reason });
-        break :blk try engines.open(allocator, "dsp-dereverb");
-    };
-    slot.setGainDb(cfg.gain_db);
     var app = App{
         .allocator = allocator,
-        .slot = slot,
+        .slot = undefined,
         .gain_db = cfg.gain_db,
         .config_path = config_path,
     };
+    rememberRuntime(&app, cfg);
+    var slot = engines.open(allocator, cfg.engine, openOpts(&app)) catch blk: {
+        const avail = engines.availability(cfg.engine);
+        std.debug.print("engine {s}: {s}\nfalling back to dsp-dereverb\n", .{ cfg.engine, avail.reason });
+        break :blk try engines.open(allocator, "dsp-dereverb", openOpts(&app));
+    };
+    slot.setGainDb(cfg.gain_db);
+    app.slot = slot;
     app.mode.store(@intFromEnum(cfg.mode), .release);
     app.listen.store(cfg.listen, .release);
     if (cfg.source.len != 0) rememberSource(&app, cfg.source);
@@ -519,11 +587,22 @@ pub fn runDaemon(allocator: std.mem.Allocator) !void {
     defer if (restore) |id| allocator.free(id);
     if (node != 0 and std.posix.getenv("NEARMIC_NO_DEFAULT") == null) setDefault(allocator, node_text);
 
-    std.debug.print("NearMic {s} is running ({s}, {d} sample delay). Pick NearMic as the microphone.\n", .{
+    const hw = accel.probe();
+    std.debug.print("NearMic {s} is running ({s}, {d} sample delay, profile {s}, {d} dsp threads, cpu budget {d:.2}, simd {s}). Pick NearMic as the microphone.\n", .{
         version,
         app.slot.name,
         app.slot.delaySamples(),
+        config.profileName(app.profile),
+        app.slot.threadsUsed(),
+        app.cpu_budget,
+        hw.simd,
     });
+    if (app.profile == .rock_pi_plus) {
+        std.debug.print("ROCK 4 Plus path: multithreaded CPU/{s}. NPU invoked: no. OpenCL detected: {s}.\n", .{
+            hw.simd,
+            if (hw.opencl) "yes" else "no",
+        });
+    }
     if (restore) |id| {
         defer setDefault(allocator, id);
         serve(&app, server);
@@ -571,7 +650,11 @@ pub fn enhance(allocator: std.mem.Allocator, in_path: []const u8, out_path: []co
     defer pcm.deinit();
     const n = pcm.samples.len - (pcm.samples.len % dsp.hop);
     if (n == 0) return error.TooShort;
-    var slot = engines.open(allocator, cfg.engine) catch {
+    var slot = engines.open(allocator, cfg.engine, .{
+        .profile = cfg.profile,
+        .threads = cfg.effectiveThreads(),
+        .cpu_budget = cfg.effectiveBudget(),
+    }) catch {
         const avail = engines.availability(cfg.engine);
         std.debug.print("engine {s}: {s}\n", .{ cfg.engine, avail.reason });
         return error.Unavailable;

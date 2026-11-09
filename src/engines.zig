@@ -1,8 +1,16 @@
 const std = @import("std");
+const config = @import("config.zig");
 const dsp = @import("dsp.zig");
 const fifo = @import("fifo.zig");
+const rock = @import("rock.zig");
 const weights = @import("weights.zig");
 const options = @import("build_options");
+
+pub const OpenOptions = struct {
+    profile: config.Profile = .desktop,
+    threads: u32 = 1,
+    cpu_budget: f32 = 0.05,
+};
 
 pub const Spec = struct {
     name: []const u8,
@@ -87,6 +95,10 @@ pub fn availability(name: []const u8) Availability {
     if (std.mem.eql(u8, spec.name, "mossformer2-48k") or std.mem.eql(u8, spec.name, "frcrn-16k") or std.mem.eql(u8, spec.name, "mossformer-gan-16k")) {
         return .{ .ok = false, .reason = clearerReason() };
     }
+    if (std.mem.eql(u8, spec.name, "speex-dereverb")) {
+        if (comptime !options.with_speex) return .{ .ok = false, .reason = "not linked in this build" };
+        return .{ .ok = true, .reason = "" };
+    }
     if (std.mem.eql(u8, spec.name, "rnnoise")) {
         if (!options.with_rnnoise) return .{ .ok = false, .reason = "not linked in this build" };
         return .{ .ok = true, .reason = "" };
@@ -122,6 +134,7 @@ pub fn printList(writer: anytype) !void {
 
 const Kind = union(enum) {
     chain: *dsp.Chain,
+    rock: *rock.Engine,
     speex: *SpeexEng,
     rnnoise: *RnnoiseEng,
     dpdf: *DpdfEng,
@@ -133,6 +146,14 @@ pub const Slot = struct {
     name: []const u8,
     adapter: fifo.Adapter,
     kind: Kind,
+    profile: config.Profile = .desktop,
+    thread_request: u32 = 1,
+    threads_used: usize = 1,
+    cpu_budget: f32 = 0.05,
+
+    pub fn threadsUsed(self: *const Slot) usize {
+        return self.threads_used;
+    }
 
     pub fn process(self: *Slot, input: []const f32, output: []f32) void {
         self.adapter.pushHop(input, output);
@@ -149,7 +170,11 @@ pub const Slot = struct {
     pub fn deinit(self: *Slot) void {
         switch (self.kind) {
             .chain => |chain| self.allocator.destroy(chain),
-            .speex => |eng| speex_eng_free(eng),
+            .rock => |eng| {
+                eng.deinit();
+                self.allocator.destroy(eng);
+            },
+            .speex => |eng| if (comptime options.with_speex) speex_eng_free(eng),
             .rnnoise => |eng| if (comptime options.with_rnnoise) rnnoise_eng_free(eng),
             .dpdf => |eng| if (comptime options.with_dpdfnet) dpdf_eng_free(eng),
             .localvqe => |eng| {
@@ -166,8 +191,17 @@ fn processChain(ctx: *anyopaque, input: []const f32, output: []f32) void {
 }
 
 fn processSpeex(ctx: *anyopaque, input: []const f32, output: []f32) void {
+    if (comptime !options.with_speex) {
+        @memset(output, 0);
+        return;
+    }
     const eng: *SpeexEng = @ptrCast(@alignCast(ctx));
     speex_eng_process(eng, input.ptr, output.ptr);
+}
+
+fn processRock(ctx: *anyopaque, input: []const f32, output: []f32) void {
+    const eng: *rock.Engine = @ptrCast(@alignCast(ctx));
+    eng.process(input, output);
 }
 
 fn processRnnoise(ctx: *anyopaque, input: []const f32, output: []f32) void {
@@ -188,7 +222,12 @@ fn processDpdf(ctx: *anyopaque, input: []const f32, output: []f32) void {
     dpdf_eng_process(eng, input.ptr, output.ptr);
 }
 
-pub fn open(allocator: std.mem.Allocator, name: []const u8) !Slot {
+fn useRock(name: []const u8, opts: OpenOptions) bool {
+    if (opts.profile != .rock_pi_plus) return false;
+    return std.mem.eql(u8, name, "dsp") or std.mem.eql(u8, name, "dsp-dereverb");
+}
+
+pub fn open(allocator: std.mem.Allocator, name: []const u8, opts: OpenOptions) !Slot {
     const spec = findSpec(name) orelse return error.UnknownEngine;
     const avail = availability(spec.name);
     const dpdf_can_fetch = options.with_dpdfnet and (std.mem.eql(u8, spec.name, "dpdfnet2") or std.mem.eql(u8, spec.name, "dpdfnet8"));
@@ -198,8 +237,21 @@ pub fn open(allocator: std.mem.Allocator, name: []const u8) !Slot {
         .name = spec.name,
         .adapter = .{ .frame = spec.frame, .algo_delay = spec.algo_delay },
         .kind = undefined,
+        .profile = opts.profile,
+        .thread_request = opts.threads,
+        .threads_used = 1,
+        .cpu_budget = opts.cpu_budget,
     };
-    if (std.mem.eql(u8, spec.name, "speex-dereverb")) {
+    if (useRock(spec.name, opts)) {
+        const denoise = true;
+        const dereverb = std.mem.eql(u8, spec.name, "dsp-dereverb");
+        const eng = try rock.Engine.open(allocator, denoise, dereverb, opts.threads, opts.cpu_budget);
+        slot.kind = .{ .rock = eng };
+        slot.threads_used = eng.threadsUsed();
+        slot.adapter.algo_delay = eng.delaySamples();
+        slot.adapter.ctx = eng;
+        slot.adapter.process_frame = processRock;
+    } else if ((comptime options.with_speex) and std.mem.eql(u8, spec.name, "speex-dereverb")) {
         const eng = speex_eng_new(1) orelse return error.Unavailable;
         slot.kind = .{ .speex = eng };
         slot.adapter.ctx = eng;

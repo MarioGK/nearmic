@@ -1,4 +1,42 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// Four-wide f32. On aarch64 this lowers to NEON. On x86-64 it lowers to SSE.
+/// ROCK 4 Plus V1.73 is big.LITTLE (Cortex-A72 + Cortex-A53). Both cores are
+/// ARMv8-A with NEON, so the cross build pins -mcpu=cortex-a53 and this vector
+/// width is legal on either cluster.
+const Vec = @Vector(4, f32);
+
+pub fn compiledSimd() []const u8 {
+    return switch (builtin.cpu.arch) {
+        .aarch64 => "neon",
+        .x86_64, .x86 => "sse",
+        else => "scalar",
+    };
+}
+
+pub fn cpuModelName() []const u8 {
+    return builtin.cpu.model.name;
+}
+
+fn load4(src: []const f32, i: usize) Vec {
+    return .{ src[i], src[i + 1], src[i + 2], src[i + 3] };
+}
+
+fn store4(dst: []f32, i: usize, v: Vec) void {
+    dst[i] = v[0];
+    dst[i + 1] = v[1];
+    dst[i + 2] = v[2];
+    dst[i + 3] = v[3];
+}
+
+pub fn applyWindow(real: []f32, window: []const f32) void {
+    var i: usize = 0;
+    while (i + 4 <= real.len) : (i += 4) {
+        store4(real, i, load4(real, i) * load4(window, i));
+    }
+    while (i < real.len) : (i += 1) real[i] *= window[i];
+}
 
 pub const sample_rate: f32 = 48000;
 pub const hop: usize = 256;
@@ -126,84 +164,120 @@ pub const Agc = struct {
     }
 };
 
-const Fft512 = struct {
-    rev: [fft_size]u16,
-    wr: [fft_size / 2]f32,
-    wi: [fft_size / 2]f32,
+pub fn FftPlan(comptime n: usize) type {
+    if (n < 8 or (n & (n - 1)) != 0) @compileError("FftPlan size must be a power of two and at least 8");
+    return struct {
+        rev: [n]u16,
+        wr: [n / 2]f32,
+        wi: [n / 2]f32,
 
-    fn init() Fft512 {
-        var plan: Fft512 = undefined;
-        for (0..fft_size) |i| {
-            var x = i;
-            var r: usize = 0;
-            var bit: usize = 0;
-            while (bit < 9) : (bit += 1) {
-                r = (r << 1) | (x & 1);
-                x >>= 1;
-            }
-            plan.rev[i] = @intCast(r);
-        }
-        for (0..fft_size / 2) |k| {
-            const ang = -2 * std.math.pi * @as(f32, @floatFromInt(k)) / @as(f32, fft_size);
-            plan.wr[k] = @cos(ang);
-            plan.wi[k] = @sin(ang);
-        }
-        return plan;
-    }
+        const Self = @This();
 
-    fn run(self: Fft512, real: []f32, imag: []f32, inverse: bool) void {
-        const n = fft_size;
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const j: usize = self.rev[i];
-            if (i < j) {
-                std.mem.swap(f32, &real[i], &real[j]);
-                std.mem.swap(f32, &imag[i], &imag[j]);
+        pub fn init() Self {
+            var plan: Self = undefined;
+            const bits = std.math.log2_int(usize, n);
+            for (0..n) |i| {
+                var x = i;
+                var r: usize = 0;
+                var bit: usize = 0;
+                while (bit < bits) : (bit += 1) {
+                    r = (r << 1) | (x & 1);
+                    x >>= 1;
+                }
+                plan.rev[i] = @intCast(r);
             }
+            for (0..n / 2) |k| {
+                const ang = -2 * std.math.pi * @as(f32, @floatFromInt(k)) / @as(f32, n);
+                plan.wr[k] = @cos(ang);
+                plan.wi[k] = @sin(ang);
+            }
+            return plan;
         }
-        var len: usize = 2;
-        while (len <= n) : (len <<= 1) {
-            const step = n / len;
-            var start: usize = 0;
-            while (start < n) : (start += len) {
-                var k: usize = 0;
-                var tw: usize = 0;
-                while (k < len / 2) : ({
-                    k += 1;
-                    tw += step;
-                }) {
-                    const wr = self.wr[tw];
-                    const wi = if (inverse) -self.wi[tw] else self.wi[tw];
-                    const a = start + k;
-                    const b = a + len / 2;
-                    const tr = wr * real[b] - wi * imag[b];
-                    const ti = wr * imag[b] + wi * real[b];
-                    real[b] = real[a] - tr;
-                    imag[b] = imag[a] - ti;
-                    real[a] += tr;
-                    imag[a] += ti;
+
+        pub fn run(self: *const Self, real: []f32, imag: []f32, inverse: bool) void {
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                const j: usize = self.rev[i];
+                if (i < j) {
+                    std.mem.swap(f32, &real[i], &real[j]);
+                    std.mem.swap(f32, &imag[i], &imag[j]);
+                }
+            }
+            var len: usize = 2;
+            while (len <= n) : (len <<= 1) {
+                const half = len / 2;
+                const step = n / len;
+                var start: usize = 0;
+                while (start < n) : (start += len) {
+                    if (half < 4) {
+                        var k: usize = 0;
+                        while (k < half) : (k += 1) {
+                            const tw = k * step;
+                            const wr = self.wr[tw];
+                            const wi = if (inverse) -self.wi[tw] else self.wi[tw];
+                            const a = start + k;
+                            const b = a + half;
+                            const tr = wr * real[b] - wi * imag[b];
+                            const ti = wr * imag[b] + wi * real[b];
+                            real[b] = real[a] - tr;
+                            imag[b] = imag[a] - ti;
+                            real[a] += tr;
+                            imag[a] += ti;
+                        }
+                    } else {
+                        var k: usize = 0;
+                        while (k < half) : (k += 4) {
+                            const tw = k * step;
+                            const wrv = Vec{
+                                self.wr[tw],
+                                self.wr[tw + step],
+                                self.wr[tw + 2 * step],
+                                self.wr[tw + 3 * step],
+                            };
+                            var wiv = Vec{
+                                self.wi[tw],
+                                self.wi[tw + step],
+                                self.wi[tw + 2 * step],
+                                self.wi[tw + 3 * step],
+                            };
+                            if (inverse) wiv = -wiv;
+                            const a = start + k;
+                            const b = a + half;
+                            const rb = load4(real, b);
+                            const ib = load4(imag, b);
+                            const ra = load4(real, a);
+                            const ia = load4(imag, a);
+                            const tr = wrv * rb - wiv * ib;
+                            const ti = wrv * ib + wiv * rb;
+                            store4(real, b, ra - tr);
+                            store4(imag, b, ia - ti);
+                            store4(real, a, ra + tr);
+                            store4(imag, a, ia + ti);
+                        }
+                    }
+                }
+            }
+            if (inverse) {
+                const inv = 1 / @as(f32, @floatFromInt(n));
+                const scale: Vec = @splat(inv);
+                var j: usize = 0;
+                while (j + 4 <= n) : (j += 4) {
+                    store4(real, j, load4(real, j) * scale);
+                    store4(imag, j, load4(imag, j) * scale);
+                }
+                while (j < n) : (j += 1) {
+                    real[j] *= inv;
+                    imag[j] *= inv;
                 }
             }
         }
-        if (inverse) {
-            const inv = 1 / @as(f32, n);
-            for (real, imag) |*r, *im| {
-                r.* *= inv;
-                im.* *= inv;
-            }
-        }
-    }
-};
+    };
+}
 
-var fft512_plan: Fft512 = undefined;
-var fft512_ready: bool = false;
-
-fn fft512() *Fft512 {
-    if (!fft512_ready) {
-        fft512_plan = Fft512.init();
-        fft512_ready = true;
+pub fn fillHann(comptime n: usize, window: *[n]f32) void {
+    for (window, 0..) |*w, i| {
+        w.* = 0.5 - 0.5 * @cos(2 * std.math.pi * @as(f32, @floatFromInt(i)) / @as(f32, n));
     }
-    return &fft512_plan;
 }
 
 fn fftRadix2(real: []f32, imag: []f32, inverse: bool) void {
@@ -253,43 +327,91 @@ fn fftRadix2(real: []f32, imag: []f32, inverse: bool) void {
     }
 }
 
+pub const Tune = struct {
+    oversub: f32 = 1.15,
+    late_mix: f32 = 0.85,
+    noise_down: f32 = 0.85,
+    noise_down_new: f32 = 0.15,
+    noise_up: f32 = 0.995,
+    noise_up_new: f32 = 0.005,
+};
+
 pub const Spectral = struct {
     denoise: bool,
     dereverb: bool,
+    oversub: f32,
+    late_mix: f32,
+    noise_down: f32,
+    noise_down_new: f32,
+    noise_up: f32,
+    noise_up_new: f32,
     window: [fft_size]f32,
-    hist: [hop]f32 = .{0} ** hop,
-    ola: [fft_size]f32 = .{0} ** fft_size,
-    noise: [bins]f32 = .{0} ** bins,
-    late: [bins]f32 = .{0} ** bins,
-    late_hist: [8][bins]f32 = .{.{0} ** bins} ** 8,
-    late_pos: usize = 0,
-    prev_gain: [bins]f32 = .{1} ** bins,
-    primed: bool = false,
+    hist: [hop]f32,
+    ola: [fft_size]f32,
+    noise: [bins]f32,
+    late: [bins]f32,
+    late_hist: [8][bins]f32,
+    late_pos: usize,
+    prev_gain: [bins]f32,
+    primed: bool,
+    plan: FftPlan(fft_size),
+    real_buf: [fft_size]f32,
+    imag_buf: [fft_size]f32,
+    mag_buf: [bins]f32,
 
     pub fn init(denoise: bool, dereverb: bool) Spectral {
-        var s = Spectral{
-            .denoise = denoise,
-            .dereverb = dereverb,
-            .window = undefined,
-        };
-        for (0..fft_size) |i| {
-            s.window[i] = 0.5 - 0.5 * @cos(2 * std.math.pi * @as(f32, @floatFromInt(i)) / @as(f32, fft_size));
-        }
+        return initTune(denoise, dereverb, .{});
+    }
+
+    pub fn initTune(denoise: bool, dereverb: bool, tune: Tune) Spectral {
+        var s: Spectral = undefined;
+        s.denoise = denoise;
+        s.dereverb = dereverb;
+        s.oversub = tune.oversub;
+        s.late_mix = tune.late_mix;
+        s.noise_down = tune.noise_down;
+        s.noise_down_new = tune.noise_down_new;
+        s.noise_up = tune.noise_up;
+        s.noise_up_new = tune.noise_up_new;
+        s.late_pos = 0;
+        s.primed = false;
+        fillHann(fft_size, &s.window);
+        @memset(&s.hist, 0);
+        @memset(&s.ola, 0);
+        @memset(&s.noise, 0);
+        @memset(&s.late, 0);
+        for (&s.late_hist) |*row| @memset(row, 0);
+        @memset(&s.prev_gain, 1);
+        @memset(&s.real_buf, 0);
+        @memset(&s.imag_buf, 0);
+        @memset(&s.mag_buf, 0);
+        s.plan = FftPlan(fft_size).init();
         return s;
     }
 
     pub fn processHop(self: *Spectral, input: []const f32, output: []f32) void {
-        std.debug.assert(input.len == hop and output.len == hop);
-        var real: [fft_size]f32 = .{0} ** fft_size;
-        var imag: [fft_size]f32 = .{0} ** fft_size;
-        @memcpy(real[0..hop], &self.hist);
-        @memcpy(real[hop..], input);
-        @memcpy(&self.hist, input);
-        for (0..fft_size) |i| real[i] *= self.window[i];
-        fft512().run(&real, &imag, false);
+        self.analyze(input);
+        self.synthesize(output, null);
+    }
 
-        var mag: [bins]f32 = undefined;
-        for (0..bins) |k| mag[k] = @sqrt(real[k] * real[k] + imag[k] * imag[k]) + 1e-12;
+    pub fn analyze(self: *Spectral, input: []const f32) void {
+        std.debug.assert(input.len == hop);
+        @memcpy(self.real_buf[0..hop], &self.hist);
+        @memcpy(self.real_buf[hop..], input);
+        @memcpy(&self.hist, input);
+        @memset(&self.imag_buf, 0);
+        applyWindow(&self.real_buf, &self.window);
+        self.plan.run(&self.real_buf, &self.imag_buf, false);
+        for (0..bins) |k| {
+            self.mag_buf[k] = @sqrt(self.real_buf[k] * self.real_buf[k] + self.imag_buf[k] * self.imag_buf[k]) + 1e-12;
+        }
+    }
+
+    pub fn synthesize(self: *Spectral, output: []f32, external: ?[]const f32) void {
+        std.debug.assert(output.len == hop);
+        const real = &self.real_buf;
+        const imag = &self.imag_buf;
+        const mag = &self.mag_buf;
 
         if (self.dereverb) {
             const old = self.late_pos;
@@ -297,7 +419,7 @@ pub const Spectral = struct {
                 const before = mag[k];
                 const delayed = self.late_hist[old][k];
                 self.late[k] = 0.65 * self.late[k] + 0.35 * delayed;
-                var cleaned = before - 0.85 * self.late[k];
+                var cleaned = before - self.late_mix * self.late[k];
                 if (cleaned < 0.2 * before) cleaned = 0.2 * before;
                 mag[k] = cleaned;
                 self.late_hist[old][k] = before;
@@ -310,11 +432,19 @@ pub const Spectral = struct {
                 if (!self.primed) {
                     self.noise[k] = mag[k];
                 } else if (mag[k] < self.noise[k]) {
-                    self.noise[k] = 0.85 * self.noise[k] + 0.15 * mag[k];
+                    self.noise[k] = self.noise_down * self.noise[k] + self.noise_down_new * mag[k];
                 } else {
-                    self.noise[k] = 0.995 * self.noise[k] + 0.005 * mag[k];
+                    self.noise[k] = self.noise_up * self.noise[k] + self.noise_up_new * mag[k];
                 }
-                var g = 1 - 1.15 * self.noise[k] / mag[k];
+                var noise = self.noise[k];
+                if (external) |ext| {
+                    const floor = ext[k];
+                    // A fine-resolution floor below this bin means the band is
+                    // noise, not a harmonic. Suppress it further. Harmonics sit
+                    // well above that floor and keep the normal gain.
+                    if (floor > 1e-12 and mag[k] <= floor * 2.2) noise = @max(noise, floor);
+                }
+                var g = 1 - self.oversub * noise / mag[k];
                 if (g < 0.06) g = 0.06;
                 if (g > 1) g = 1;
                 const prev = self.prev_gain[k];
@@ -343,7 +473,7 @@ pub const Spectral = struct {
             }
         }
 
-        fft512().run(&real, &imag, true);
+        self.plan.run(real, imag, true);
         for (0..fft_size) |i| self.ola[i] += real[i] * self.window[i];
         @memcpy(output, self.ola[0..hop]);
         var shift: [fft_size]f32 = .{0} ** fft_size;
@@ -509,8 +639,9 @@ test "fft512 roundtrip" {
     real[3] = -0.25;
     real[40] = 0.5;
     const orig = real;
-    fft512().run(&real, &imag, false);
-    fft512().run(&real, &imag, true);
+    var plan = FftPlan(fft_size).init();
+    plan.run(&real, &imag, false);
+    plan.run(&real, &imag, true);
     for (orig, real) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-4);
     for (imag) |im| try std.testing.expect(@abs(im) < 1e-4);
 }

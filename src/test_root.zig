@@ -8,4 +8,6 @@ test {
     _ = @import("install.zig");
     _ = @import("engines.zig");
     _ = @import("qa.zig");
+    _ = @import("rock.zig");
+    _ = @import("accel.zig");
 }

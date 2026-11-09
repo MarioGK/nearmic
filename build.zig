@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const target = selectTarget(b);
     const optimize = b.standardOptimizeOption(.{});
     const shipped = b.option([]const u8, "engine", "Shipped bake-off engine. The runtime engine comes from config.toml") orelse "dsp-dereverb";
     const bundle = b.option(bool, "bundle", "Statically link RNNoise and native DPDFNet") orelse false;
@@ -42,6 +42,11 @@ const Bundle = struct {
     fftw_a: ?[]const u8 = null,
     cpuinfo_o: ?[]const u8 = null,
 };
+
+fn fileExists(path: []const u8) bool {
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
+}
 
 fn firstExisting(paths: []const []const u8) ?[]const u8 {
     for (paths) |path| {
@@ -144,32 +149,64 @@ fn addExe(
     return exe;
 }
 
+fn selectTarget(b: *std.Build) std.Build.ResolvedTarget {
+    const selected = b.standardTargetOptions(.{});
+    if (selected.result.cpu.arch != .aarch64) return selected;
+    switch (selected.query.cpu_model) {
+        .explicit, .native, .baseline => return selected,
+        .determined_by_arch_os => {},
+    }
+    // ROCK 4 Plus V1.73 is RK3399: Cortex-A72 + Cortex-A53. cortex-a53 is the
+    // ISA both clusters can run, and it has NEON. -Dcpu= still overrides this.
+    var query = selected.query;
+    query.cpu_model = .{ .explicit = &std.Target.aarch64.cpu.cortex_a53 };
+    return b.resolveTargetQuery(query);
+}
+
+fn mcpuFlag(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const u8 {
+    if (target.result.cpu.arch != .aarch64) return null;
+    const llvm = target.result.cpu.model.llvm_name orelse "cortex-a53";
+    return std.fmt.allocPrint(b.allocator, "-mcpu={s}", .{llvm}) catch "-mcpu=cortex-a53";
+}
+
 fn linkRuntime(
     b: *std.Build,
     step: *std.Build.Step.Compile,
     shipped: []const u8,
     bundle: Bundle,
 ) void {
+    const target = step.root_module.resolved_target orelse @panic("missing target");
+    const host_speex = target.result.cpu.arch == .x86_64 and fileExists("/usr/lib/x86_64-linux-gnu/libspeexdsp.a");
     const opts = b.addOptions();
     opts.addOption([]const u8, "shipped", shipped);
-    opts.addOption(bool, "with_speex", true);
+    opts.addOption(bool, "with_speex", host_speex);
     opts.addOption(bool, "with_rnnoise", bundle.rnnoise_a != null);
     opts.addOption(bool, "with_dpdfnet", bundle.dpdf_a != null);
     step.root_module.addOptions("build_options", opts);
     step.linkLibC();
-    step.linkSystemLibrary("m");
-    step.linkSystemLibrary("dl");
+    if (target.result.abi != .musl) {
+        step.linkSystemLibrary("m");
+        step.linkSystemLibrary("dl");
+    }
+    var c_flags = std.ArrayList([]const u8).init(b.allocator);
+    c_flags.appendSlice(&.{ "-std=c11", "-D_GNU_SOURCE", "-Wall" }) catch @panic("oom");
+    if (mcpuFlag(b, target)) |flag| c_flags.append(flag) catch @panic("oom");
     step.addIncludePath(.{ .cwd_relative = "/usr/include/pipewire-0.3" });
     step.addIncludePath(.{ .cwd_relative = "/usr/include/spa-0.2" });
     step.addCSourceFile(.{
         .file = b.path("src/c/pw_glue.c"),
-        .flags = &.{ "-std=c11", "-D_GNU_SOURCE", "-Wall" },
+        .flags = c_flags.items,
     });
-    step.addCSourceFile(.{
-        .file = b.path("src/c/speex_eng.c"),
-        .flags = &.{"-std=c11"},
-    });
-    step.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libspeexdsp.a" });
+    if (host_speex) {
+        var speex_flags = std.ArrayList([]const u8).init(b.allocator);
+        speex_flags.append("-std=c11") catch @panic("oom");
+        if (mcpuFlag(b, target)) |flag| speex_flags.append(flag) catch @panic("oom");
+        step.addCSourceFile(.{
+            .file = b.path("src/c/speex_eng.c"),
+            .flags = speex_flags.items,
+        });
+        step.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libspeexdsp.a" });
+    }
     if (bundle.rnnoise_a) |lib| {
         step.addIncludePath(.{ .cwd_relative = bundle.rnnoise_inc.? });
         step.addCSourceFile(.{

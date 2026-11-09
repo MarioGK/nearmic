@@ -223,6 +223,8 @@ pub fn main() !void {
             cfg_path,
             if (app.pipewireLibraryPresent()) "present" else "missing",
         });
+        const accel = @import("accel.zig");
+        accel.write(std.io.getStdOut().writer(), accel.probe()) catch {};
         const reply = app.sendCommand(allocator, "status") catch |err| switch (err) {
             error.NotRunning => {
                 std.debug.print("daemon=not running\n", .{});

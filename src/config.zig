@@ -3,13 +3,38 @@ const toml = @import("toml.zig");
 
 pub const Mode = enum(u8) { suppress, bypass, mute };
 
+pub const Profile = enum { desktop, rock_pi_plus };
+
+pub fn parseProfile(text: []const u8) ?Profile {
+    if (std.mem.eql(u8, text, "desktop")) return .desktop;
+    if (std.mem.eql(u8, text, "rock-pi-plus")) return .rock_pi_plus;
+    return null;
+}
+
+pub fn profileName(profile: Profile) []const u8 {
+    return switch (profile) {
+        .desktop => "desktop",
+        .rock_pi_plus => "rock-pi-plus",
+    };
+}
+
 pub const default_text =
     \\# NearMic reads this file from $HOME/.config/nearmic/config.toml.
-    \\# engine, mode, listen, and gain_db reload while nearmic run is up.
-    \\# A bad edit is ignored and the previous values stay in effect.
+    \\# engine, mode, listen, gain_db, profile, threads, and cpu_budget reload
+    \\# between audio blocks while nearmic run is up. The thread pool is rebuilt
+    \\# then. A bad edit is ignored and the previous values stay in effect.
     \\# source is the PipeWire node.name of the real microphone. Empty means
     \\# whichever source was the default when the daemon started. A new source
     \\# is used the next time the daemon starts, so it does not race PipeWire.
+    \\# profile selects the machine budget. desktop keeps the bake-off gate:
+    \\# cpu_budget 0.05 and one DSP thread, engine dsp-dereverb.
+    \\# rock-pi-plus is the Radxa ROCK 4 Plus V1.73 (Rockchip OP1 / RK3399:
+    \\# 2x Cortex-A72 + 4x Cortex-A53, Mali-T860MP4, no RKNPU). It sets
+    \\# cpu_budget to 0.90 and threads to 0, which means every core, never
+    \\# more than nproc. The PipeWire callback still only moves samples.
+    \\# An explicit threads or cpu_budget line overrides the profile.
+    \\# threads applies between blocks; you do not need to restart for it.
+    \\profile = "desktop"
     \\
     \\source = ""
     \\
@@ -31,6 +56,14 @@ pub const default_text =
     \\# brings that model inside the loudness gate. It does not replace dsp-dereverb.
     \\gain_db = 0
     \\
+    \\# threads = 0 uses every core and is capped at nproc. Leave this commented
+    \\# to take the profile default: 1 on desktop, every core on rock-pi-plus.
+    \\# threads = 1
+    \\
+    \\# cpu_budget is the fraction of the machine the worker may use. It is a
+    \\# ceiling, not a spin. desktop is 0.05. rock-pi-plus is 0.90.
+    \\# cpu_budget = 0.05
+    \\
 ;
 
 pub const Config = struct {
@@ -39,11 +72,32 @@ pub const Config = struct {
     listen: bool,
     engine: []u8,
     gain_db: f32,
+    profile: Profile = .desktop,
+    threads: u32 = 1,
+    cpu_budget: f32 = 0.05,
+    threads_explicit: bool = false,
+    budget_explicit: bool = false,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *Config) void {
         self.allocator.free(self.source);
         self.allocator.free(self.engine);
+    }
+
+    pub fn effectiveThreads(self: Config) u32 {
+        if (self.threads_explicit) return self.threads;
+        return switch (self.profile) {
+            .desktop => 1,
+            .rock_pi_plus => 0,
+        };
+    }
+
+    pub fn effectiveBudget(self: Config) f32 {
+        if (self.budget_explicit) return self.cpu_budget;
+        return switch (self.profile) {
+            .desktop => 0.05,
+            .rock_pi_plus => 0.90,
+        };
     }
 
     pub fn dupe(self: Config) !Config {
@@ -53,6 +107,11 @@ pub const Config = struct {
             .listen = self.listen,
             .engine = try self.allocator.dupe(u8, self.engine),
             .gain_db = self.gain_db,
+            .profile = self.profile,
+            .threads = self.threads,
+            .cpu_budget = self.cpu_budget,
+            .threads_explicit = self.threads_explicit,
+            .budget_explicit = self.budget_explicit,
             .allocator = self.allocator,
         };
     }
@@ -70,6 +129,11 @@ pub fn defaults(allocator: std.mem.Allocator) !Config {
         .listen = false,
         .engine = try allocator.dupe(u8, "dsp-dereverb"),
         .gain_db = 0,
+        .profile = .desktop,
+        .threads = 1,
+        .cpu_budget = 0.05,
+        .threads_explicit = false,
+        .budget_explicit = false,
         .allocator = allocator,
     };
 }
@@ -150,6 +214,35 @@ fn overlay(allocator: std.mem.Allocator, doc: *toml.Document, next: *Config) !?[
         },
         else => return try typeMsg(allocator, "gain_db"),
     };
+    if (doc.get("profile")) |value| switch (value) {
+        .string => |s| next.profile = parseProfile(s) orelse {
+            return try allocator.dupe(u8, "config.toml: profile must be desktop or rock-pi-plus");
+        },
+        else => return try typeMsg(allocator, "profile"),
+    };
+    if (doc.get("threads")) |value| switch (value) {
+        .number => |n| {
+            if (!std.math.isFinite(n)) return try allocator.dupe(u8, "config.toml: threads is not finite");
+            const rounded = @round(n);
+            if (@abs(n - rounded) > 1e-6 or rounded < 0 or rounded > 256) {
+                return try allocator.dupe(u8, "config.toml: threads must be a whole number from 0 to 256");
+            }
+            next.threads = @intFromFloat(rounded);
+            next.threads_explicit = true;
+        },
+        else => return try typeMsg(allocator, "threads"),
+    };
+    if (doc.get("cpu_budget")) |value| switch (value) {
+        .number => |n| {
+            const g: f32 = @floatCast(n);
+            if (!std.math.isFinite(g) or g < 0 or g > 1) {
+                return try allocator.dupe(u8, "config.toml: cpu_budget must be from 0 to 1");
+            }
+            next.cpu_budget = g;
+            next.budget_explicit = true;
+        },
+        else => return try typeMsg(allocator, "cpu_budget"),
+    };
     return null;
 }
 
@@ -227,6 +320,52 @@ test "default text loads the shipped engine" {
             try std.testing.expect(!cfg.listen);
             try std.testing.expectApproxEqAbs(@as(f32, 0), cfg.gain_db, 0.0001);
             try std.testing.expectEqualStrings("", cfg.source);
+            try std.testing.expectEqual(Profile.desktop, cfg.profile);
+            try std.testing.expectEqual(@as(u32, 1), cfg.effectiveThreads());
+            try std.testing.expectApproxEqAbs(@as(f32, 0.05), cfg.effectiveBudget(), 0.0001);
+        },
+    }
+}
+
+test "rock-pi-plus profile allows every core and a 0.90 budget" {
+    var loaded = try load(std.testing.allocator, "profile = \"rock-pi-plus\"\n");
+    defer switch (loaded) {
+        .ok => |*cfg| cfg.deinit(),
+        .err => |msg| std.testing.allocator.free(msg),
+    };
+    switch (loaded) {
+        .err => |msg| {
+            std.debug.print("{s}\n", .{msg});
+            return error.BadProfile;
+        },
+        .ok => |cfg| {
+            try std.testing.expectEqualStrings("dsp-dereverb", cfg.engine);
+            try std.testing.expectEqual(Profile.rock_pi_plus, cfg.profile);
+            try std.testing.expectEqual(@as(u32, 0), cfg.effectiveThreads());
+            try std.testing.expectApproxEqAbs(@as(f32, 0.90), cfg.effectiveBudget(), 0.0001);
+            try std.testing.expect(!cfg.threads_explicit);
+            try std.testing.expect(!cfg.budget_explicit);
+        },
+    }
+}
+
+test "explicit threads and cpu_budget override the rock profile" {
+    const text =
+        \\profile = "rock-pi-plus"
+        \\threads = 2
+        \\cpu_budget = 0.40
+        \\
+    ;
+    var loaded = try load(std.testing.allocator, text);
+    defer switch (loaded) {
+        .ok => |*cfg| cfg.deinit(),
+        .err => |msg| std.testing.allocator.free(msg),
+    };
+    switch (loaded) {
+        .err => return error.BadOverride,
+        .ok => |cfg| {
+            try std.testing.expectEqual(@as(u32, 2), cfg.effectiveThreads());
+            try std.testing.expectApproxEqAbs(@as(f32, 0.40), cfg.effectiveBudget(), 0.0001);
         },
     }
 }

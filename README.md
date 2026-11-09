@@ -37,21 +37,62 @@ nearmic quit
 
 `enhance` reads and writes 48 kHz WAV and uses the engine in the config file. Stereo input is mixed to mono.
 
-Config is `~/.config/nearmic/config.toml`. `engine`, `mode`, `listen`, and `gain_db` are picked up while the daemon is running. A bad edit keeps the previous config. Changing `source` applies the next time the daemon starts, so it does not reopen PipeWire underneath the stream.
+Config is `~/.config/nearmic/config.toml`. `engine`, `mode`, `listen`, `gain_db`, `profile`, `threads`, and `cpu_budget` are picked up between audio blocks while the daemon is running. A thread-count change rebuilds the worker pool then. A bad edit keeps the previous config. Changing `source` applies the next time the daemon starts, so it does not reopen PipeWire underneath the stream.
 
 ```toml
+profile = "desktop"
 engine = "dsp-dereverb"
 mode = "suppress"
 listen = false
 gain_db = 0.0
 source = ""
+# threads = 1
+# cpu_budget = 0.05
 ```
 
 `source` is the PipeWire node name of the real microphone. Leave it empty and NearMic captures whichever source was the default when it started. It never captures itself. Set `NEARMIC_NO_DEFAULT=1` if NearMic should not become the default source.
 
 The default engine is still `dsp-dereverb`. Its delay is one 256-sample hop, about 5.3 ms, and suppress, bypass, and mute keep that delay. Other engines keep their own fixed delay. `gain_db` is makeup after the engine. DPDFNet model 8 sits near -32 dBFS on the synthetic fixture until `gain_db` is about 6. `dsp-dereverb` does not need that.
 
-`nearmic engines` lists every measured engine and whether this binary can run it. `nearmic qa` runs the ones it can. It exits 1 if `leveler`, `dsp`, `dsp-dereverb`, or `speex-dereverb` emits non-finite audio, or if `dsp-dereverb` misses the loudness or pause gate. Anything not linked is a skip. SpeexDSP is linked into the binary. A release build also links RNNoise and native DPDFNet (`scripts/bundle.sh`, then `zig build -Dbundle=true`). DPDFNet weights are checked by sha256 and stored in `~/.local/share/nearmic/` (`nearmic fetch`, or the first time that engine is selected). LocalVQE is not linked into the binary. It runs only when `liblocalvqe.so` and its gguf are already on disk, loaded with `dlopen`. If either file is missing, `nearmic engines` and `qa` skip it and say why. ClearerVoice is PyTorch and is never run; `qa` skips it.
+`nearmic engines` lists every measured engine and whether this binary can run it. `nearmic qa` runs the ones it can. It exits 1 if `leveler`, `dsp`, `dsp-dereverb`, or `speex-dereverb` emits non-finite audio, or if `dsp-dereverb` misses the loudness or pause gate. It also runs the `rock-pi-plus` profile on this machine: more than one DSP thread, a 0.90 budget, finite audio, and the same loudness and pause gates. That profile does not replace the 0.05 desktop CPU gate. Anything not linked is a skip. SpeexDSP is linked into the binary. A release build also links RNNoise and native DPDFNet (`scripts/bundle.sh`, then `zig build -Dbundle=true`). DPDFNet weights are checked by sha256 and stored in `~/.local/share/nearmic/` (`nearmic fetch`, or the first time that engine is selected). LocalVQE is not linked into the binary. It runs only when `liblocalvqe.so` and its gguf are already on disk, loaded with `dlopen`. If either file is missing, `nearmic engines` and `qa` skip it and say why. ClearerVoice is PyTorch and is never run; `qa` skips it.
+
+## ROCK 4 Plus V1.73
+
+`profile = "rock-pi-plus"` is the Radxa ROCK Pi 4 Plus, PCB V1.73 (ROCK 4A+ and ROCK 4B+ share that board). It is not a ROCK 5.
+
+| | |
+| --- | --- |
+| SoC | Rockchip OP1, the 2.0 GHz bin of the RK3399 |
+| CPU | 2x Cortex-A72 + 4x Cortex-A53 (6 cores) |
+| GPU | Mali-T860MP4, OpenGL ES 3.2, Vulkan 1.0, OpenCL 1.1/1.2 |
+| NPU | none. The RK3399Pro has an NPU; OP1 does not |
+| RAM | 2 GB or 4 GB LPDDR4 |
+
+The profile sets `cpu_budget` to 0.90 and `threads` to 0. Zero means every core, and the pool never starts more DSP threads than `nproc`. An explicit `threads` or `cpu_budget` line overrides the profile. `profile = "desktop"` is the default: `dsp-dereverb`, one DSP thread, budget 0.05. That is still the bake-off gate.
+
+```sh
+# On the board, or from an x86 machine. -Dcpu may be omitted; aarch64
+# without a CPU still pins cortex-a53 so the same binary can run on
+# either cluster. Both the A72 and the A53 are ARMv8-A with NEON.
+zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl -Dcpu=cortex_a53
+```
+
+The hot path is `@Vector(4, f32)` in the 512/1024/2048 FFT and in the window multiply. On this target that is NEON (`fmul` / `fadd` on `v` registers, `.4s`). The x86_64 build lowers the same vectors to SSE. The PipeWire callback only copies samples. DSP runs on the worker, which fans the rock profile's jobs out to the pool.
+
+For `dsp-dereverb` and `dsp`, the rock profile runs an ensemble instead of the single desktop chain: up to three 512-point denoise/dereverb hypotheses, averaged with the stronger one weighted more, plus 1024- and 2048-point noise trackers that push stationary bins down. The leveler is unchanged, so speech stays near -18 dBFS. Delay stays one 256-sample hop, about 5.3 ms. Other engines (Speex, RNNoise, DPDFNet, LocalVQE) are not multithreaded. DPDFNet in this tree is AVX2 and is not the ARM path.
+
+What is actually compiled in, and what is only detected:
+
+| | Compiled in | Used at runtime |
+| --- | --- | --- |
+| NEON STFT (`-mcpu=cortex-a53`) | yes, on the aarch64 build | yes, whenever that binary runs the FFT |
+| Extra DSP threads | yes | yes, when `profile = "rock-pi-plus"` |
+| RKNN / RKNPU | no model, no toolkit calls that run a network | no. `librknnrt.so`, `/dev/rknpu`, and `~/.local/share/nearmic/enhancer.rknn` are checked. All three missing, or present without a tensor map, keeps the CPU ensemble. `accel.selectNpu` is that hook and it returns false |
+| Mali OpenCL | no kernel | no. `libOpenCL.so` or `libmali.so` is reported by `nearmic doctor` and `nearmic qa` and is not called. A 256-sample hop is smaller than a useful GPU launch |
+
+SpeexDSP is linked only when the target is x86_64 and `/usr/lib/x86_64-linux-gnu/libspeexdsp.a` is present. The aarch64 musl binary is static and skips Speex. PipeWire is still `dlopen` on the board.
+
+These numbers were measured on the build machine, a 4-core Xeon, not on a ROCK 4 Plus. `nearmic qa` there reported the rock profile at 4 threads, budget 0.90, p99 0.052 ms of the 5.333 ms hop, CPU 0.0031 (process CPU time / audio seconds / nproc), speech -20.4 dBFS, pause -42.6 dBFS. Desktop `dsp-dereverb` on the same fixture was speech -20.4 dBFS and pause -41.1 dBFS. The same `cortex_a53` binary under `qemu-aarch64-static` on that Xeon reported `simd=neon`, `cpu_model=cortex_a53`, p99 0.869 ms, and the same speech and pause levels. Its CPU fraction read as 0 because qemu-user's `/proc/self/stat` is not the board's accounting. Nothing here was timed on the ROCK 4 Plus itself.
 
 ## What the chain does
 

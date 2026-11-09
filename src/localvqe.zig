@@ -105,7 +105,7 @@ fn modelFile(name: []const u8) ?[]const u8 {
 
 fn cast(comptime T: type, ptr: ?*anyopaque) ?T {
     const raw = ptr orelse return null;
-    return @ptrCast(raw);
+    return @ptrCast(@alignCast(raw));
 }
 
 fn exists(path: []const u8) bool {
