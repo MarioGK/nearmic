@@ -1,0 +1,538 @@
+const std = @import("std");
+
+pub const sample_rate: f32 = 48000;
+pub const hop: usize = 256;
+pub const fft_size: usize = 512;
+pub const bins: usize = fft_size / 2 + 1;
+
+pub const target_db: f32 = -18;
+pub const max_gain_db: f32 = 30;
+pub const speech_db: f32 = -42;
+
+fn dbToLin(db: f32) f32 {
+    return std.math.pow(f32, 10, db / 20);
+}
+
+pub const Biquad = struct {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    z1: f32 = 0,
+    z2: f32 = 0,
+
+    pub fn process(self: *Biquad, x: f32) f32 {
+        const y = self.b0 * x + self.z1;
+        self.z1 = self.b1 * x - self.a1 * y + self.z2;
+        self.z2 = self.b2 * x - self.a2 * y;
+        return y;
+    }
+
+    pub fn highpass(fs: f32, freq: f32, q: f32) Biquad {
+        const w0 = 2 * std.math.pi * freq / fs;
+        const cosw = @cos(w0);
+        const sinw = @sin(w0);
+        const alpha = sinw / (2 * q);
+        const b0 = (1 + cosw) / 2;
+        const b1 = -(1 + cosw);
+        const b2 = (1 + cosw) / 2;
+        const a0 = 1 + alpha;
+        const a1 = -2 * cosw;
+        const a2 = 1 - alpha;
+        return .{
+            .b0 = b0 / a0,
+            .b1 = b1 / a0,
+            .b2 = b2 / a0,
+            .a1 = a1 / a0,
+            .a2 = a2 / a0,
+        };
+    }
+
+    pub fn highShelf(fs: f32, freq: f32, gain_db: f32) Biquad {
+        const a = std.math.pow(f32, 10, gain_db / 40);
+        const w0 = 2 * std.math.pi * freq / fs;
+        const cosw = @cos(w0);
+        const sinw = @sin(w0);
+        const alpha = sinw / 2 * @sqrt((a + 1 / a) * (1 / 1 - 1) + 2);
+        const two_sqrt_a_alpha = 2 * @sqrt(a) * alpha;
+        const b0 = a * ((a + 1) + (a - 1) * cosw + two_sqrt_a_alpha);
+        const b1 = -2 * a * ((a - 1) + (a + 1) * cosw);
+        const b2 = a * ((a + 1) + (a - 1) * cosw - two_sqrt_a_alpha);
+        const a0 = (a + 1) - (a - 1) * cosw + two_sqrt_a_alpha;
+        const a1 = 2 * ((a - 1) - (a + 1) * cosw);
+        const a2 = (a + 1) - (a - 1) * cosw - two_sqrt_a_alpha;
+        return .{
+            .b0 = b0 / a0,
+            .b1 = b1 / a0,
+            .b2 = b2 / a0,
+            .a1 = a1 / a0,
+            .a2 = a2 / a0,
+        };
+    }
+};
+
+pub const Limiter = struct {
+    ceiling: f32 = dbToLin(-1),
+
+    pub fn process(self: Limiter, x: f32) f32 {
+        const ax = @abs(x);
+        if (ax <= self.ceiling) return x;
+        const over = ax - self.ceiling;
+        var y = self.ceiling + over / (1 + over / 0.15);
+        if (y > 0.98) y = 0.98;
+        return std.math.copysign(y, x);
+    }
+};
+
+pub const Agc = struct {
+    makeup: f32 = 1,
+    duck: f32 = 1,
+    target: f32 = dbToLin(target_db),
+    max_gain: f32 = dbToLin(max_gain_db),
+    speech_rms: f32 = dbToLin(speech_db),
+    attack: f32,
+    release: f32,
+    duck_open: f32,
+    duck_close: f32,
+
+    pub fn init() Agc {
+        return .{
+            .attack = coeff(0.012),
+            .release = coeff(0.300),
+            .duck_open = coeff(0.008),
+            .duck_close = coeff(0.070),
+        };
+    }
+
+    fn coeff(seconds: f32) f32 {
+        return 1 - @exp(-(@as(f32, hop) / sample_rate) / seconds);
+    }
+
+    pub fn process(self: *Agc, input_rms: f32, samples: []f32) void {
+        const speech = input_rms >= self.speech_rms;
+        if (speech) {
+            var desired = if (input_rms > 1e-8) self.target / input_rms else self.max_gain;
+            if (desired > self.max_gain) desired = self.max_gain;
+            if (desired < 0.25) desired = 0.25;
+            const c = if (desired < self.makeup) self.attack else self.release;
+            self.makeup += c * (desired - self.makeup);
+            self.duck += self.duck_open * (1 - self.duck);
+        } else {
+            self.duck += self.duck_close * (0.02 - self.duck);
+        }
+        const g = self.makeup * self.duck;
+        for (samples) |*s| s.* *= g;
+    }
+};
+
+fn fftRadix2(real: []f32, imag: []f32, inverse: bool) void {
+    const n = real.len;
+    var i: usize = 1;
+    var j: usize = 0;
+    while (i < n) : (i += 1) {
+        var bit: usize = n >> 1;
+        while (j & bit != 0) : (bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            std.mem.swap(f32, &real[i], &real[j]);
+            std.mem.swap(f32, &imag[i], &imag[j]);
+        }
+    }
+    var len: usize = 2;
+    while (len <= n) : (len <<= 1) {
+        const ang = (if (inverse) @as(f32, 2) else @as(f32, -2)) * std.math.pi / @as(f32, @floatFromInt(len));
+        const wlen_r = @cos(ang);
+        const wlen_i = @sin(ang);
+        var start: usize = 0;
+        while (start < n) : (start += len) {
+            var wr: f32 = 1;
+            var wi: f32 = 0;
+            var k: usize = 0;
+            while (k < len / 2) : (k += 1) {
+                const a = start + k;
+                const b = a + len / 2;
+                const tr = wr * real[b] - wi * imag[b];
+                const ti = wr * imag[b] + wi * real[b];
+                real[b] = real[a] - tr;
+                imag[b] = imag[a] - ti;
+                real[a] += tr;
+                imag[a] += ti;
+                const nwr = wr * wlen_r - wi * wlen_i;
+                wi = wr * wlen_i + wi * wlen_r;
+                wr = nwr;
+            }
+        }
+    }
+    if (inverse) {
+        const inv = 1 / @as(f32, @floatFromInt(n));
+        for (real, imag) |*r, *im| {
+            r.* *= inv;
+            im.* *= inv;
+        }
+    }
+}
+
+pub const Spectral = struct {
+    denoise: bool,
+    dereverb: bool,
+    window: [fft_size]f32,
+    hist: [hop]f32 = .{0} ** hop,
+    ola: [fft_size]f32 = .{0} ** fft_size,
+    noise: [bins]f32 = .{0} ** bins,
+    late: [bins]f32 = .{0} ** bins,
+    late_hist: [8][bins]f32 = .{.{0} ** bins} ** 8,
+    late_pos: usize = 0,
+    prev_gain: [bins]f32 = .{1} ** bins,
+    primed: bool = false,
+
+    pub fn init(denoise: bool, dereverb: bool) Spectral {
+        var s = Spectral{
+            .denoise = denoise,
+            .dereverb = dereverb,
+            .window = undefined,
+        };
+        for (0..fft_size) |i| {
+            s.window[i] = 0.5 - 0.5 * @cos(2 * std.math.pi * @as(f32, @floatFromInt(i)) / @as(f32, fft_size));
+        }
+        return s;
+    }
+
+    pub fn processHop(self: *Spectral, input: []const f32, output: []f32) void {
+        std.debug.assert(input.len == hop and output.len == hop);
+        var real: [fft_size]f32 = .{0} ** fft_size;
+        var imag: [fft_size]f32 = .{0} ** fft_size;
+        @memcpy(real[0..hop], &self.hist);
+        @memcpy(real[hop..], input);
+        @memcpy(&self.hist, input);
+        for (0..fft_size) |i| real[i] *= self.window[i];
+        fftRadix2(&real, &imag, false);
+
+        var mag: [bins]f32 = undefined;
+        for (0..bins) |k| mag[k] = @sqrt(real[k] * real[k] + imag[k] * imag[k]) + 1e-12;
+
+        if (self.dereverb) {
+            const old = self.late_pos;
+            for (0..bins) |k| {
+                const before = mag[k];
+                const delayed = self.late_hist[old][k];
+                self.late[k] = 0.65 * self.late[k] + 0.35 * delayed;
+                var cleaned = before - 0.85 * self.late[k];
+                if (cleaned < 0.2 * before) cleaned = 0.2 * before;
+                mag[k] = cleaned;
+                self.late_hist[old][k] = before;
+            }
+            self.late_pos = (old + 1) % self.late_hist.len;
+        }
+
+        if (self.denoise) {
+            for (0..bins) |k| {
+                if (!self.primed) {
+                    self.noise[k] = mag[k];
+                } else if (mag[k] < self.noise[k]) {
+                    self.noise[k] = 0.85 * self.noise[k] + 0.15 * mag[k];
+                } else {
+                    self.noise[k] = 0.995 * self.noise[k] + 0.005 * mag[k];
+                }
+                var g = 1 - 1.15 * self.noise[k] / mag[k];
+                if (g < 0.06) g = 0.06;
+                if (g > 1) g = 1;
+                const prev = self.prev_gain[k];
+                const smooth: f32 = if (g > prev) 0.35 else 0.65;
+                g = prev + smooth * (g - prev);
+                self.prev_gain[k] = g;
+                const scale = g * mag[k] / (@sqrt(real[k] * real[k] + imag[k] * imag[k]) + 1e-12);
+                real[k] *= scale;
+                imag[k] *= scale;
+                if (k > 0 and k < fft_size / 2) {
+                    real[fft_size - k] *= scale;
+                    imag[fft_size - k] *= scale;
+                }
+            }
+            self.primed = true;
+        } else if (self.dereverb) {
+            for (0..bins) |k| {
+                const orig = @sqrt(real[k] * real[k] + imag[k] * imag[k]) + 1e-12;
+                const scale = mag[k] / orig;
+                real[k] *= scale;
+                imag[k] *= scale;
+                if (k > 0 and k < fft_size / 2) {
+                    real[fft_size - k] *= scale;
+                    imag[fft_size - k] *= scale;
+                }
+            }
+        }
+
+        fftRadix2(&real, &imag, true);
+        for (0..fft_size) |i| self.ola[i] += real[i] * self.window[i];
+        @memcpy(output, self.ola[0..hop]);
+        var shift: [fft_size]f32 = .{0} ** fft_size;
+        @memcpy(shift[0 .. fft_size - hop], self.ola[hop..]);
+        self.ola = shift;
+    }
+};
+
+pub const Chain = struct {
+    highpass: Biquad,
+    shelf: Biquad,
+    spectral: Spectral,
+    agc: Agc,
+    limiter: Limiter,
+    use_spectral: bool,
+
+    pub fn init(denoise: bool, dereverb: bool) Chain {
+        return .{
+            .highpass = Biquad.highpass(sample_rate, 80, 0.707),
+            .shelf = Biquad.highShelf(sample_rate, 3500, 3),
+            .spectral = Spectral.init(denoise, dereverb),
+            .agc = Agc.init(),
+            .limiter = .{},
+            .use_spectral = denoise or dereverb,
+        };
+    }
+
+    pub fn delaySamples(self: Chain) usize {
+        return if (self.use_spectral) hop else 0;
+    }
+
+    pub fn name(self: Chain) []const u8 {
+        if (self.spectral.denoise and self.spectral.dereverb) return "dsp-dereverb";
+        if (self.spectral.denoise) return "dsp";
+        if (self.spectral.dereverb) return "dereverb";
+        return "leveler";
+    }
+
+    pub fn process(self: *Chain, input: []const f32, output: []f32) void {
+        self.processWith(input, output, true);
+    }
+
+    pub fn processLinear(self: *Chain, input: []const f32, output: []f32) void {
+        self.processWith(input, output, false);
+    }
+
+    fn processWith(self: *Chain, input: []const f32, output: []f32, level: bool) void {
+        std.debug.assert(input.len == output.len);
+        std.debug.assert(input.len % hop == 0);
+        var offset: usize = 0;
+        while (offset < input.len) : (offset += hop) {
+            self.processHop(input[offset..][0..hop], output[offset..][0..hop], level);
+        }
+    }
+
+    fn processHop(self: *Chain, input: []const f32, output: []f32, level: bool) void {
+        var frame: [hop]f32 = undefined;
+        var sum_sq: f32 = 0;
+        for (input, 0..) |x, i| {
+            frame[i] = self.highpass.process(x);
+            sum_sq += frame[i] * frame[i];
+        }
+        const frame_rms = @sqrt(sum_sq / @as(f32, hop));
+        if (self.use_spectral) {
+            self.spectral.processHop(&frame, output);
+        } else {
+            @memcpy(output, &frame);
+        }
+        for (output) |*s| s.* = self.shelf.process(s.*);
+        if (level) {
+            self.agc.process(frame_rms, output);
+            for (output) |*s| s.* = self.limiter.process(s.*);
+        }
+    }
+};
+
+pub const Resampler3 = struct {
+    dec_hist: [48]f32 = .{0} ** 48,
+    up_hist: [48]f32 = .{0} ** 48,
+    coeff: [48]f32,
+    phase: u8 = 0,
+
+    pub fn init() Resampler3 {
+        var c: [48]f32 = undefined;
+        const fc: f32 = 0.15;
+        var sum: f32 = 0;
+        for (0..48) |i| {
+            const x = @as(f32, @floatFromInt(i)) - 23.5;
+            const w = 0.5 - 0.5 * @cos(2 * std.math.pi * @as(f32, @floatFromInt(i)) / 47);
+            const s = if (@abs(x) < 1e-6) 2 * fc else @sin(2 * std.math.pi * fc * x) / (std.math.pi * x);
+            c[i] = s * w;
+            sum += c[i];
+        }
+        for (&c) |*v| v.* /= sum;
+        return .{ .coeff = c };
+    }
+
+    pub fn decimate(self: *Resampler3, input: []const f32, output: []f32) usize {
+        var produced: usize = 0;
+        for (input) |x| {
+            var i: usize = 47;
+            while (i > 0) : (i -= 1) self.dec_hist[i] = self.dec_hist[i - 1];
+            self.dec_hist[0] = x;
+            self.phase += 1;
+            if (self.phase == 3) {
+                self.phase = 0;
+                if (produced >= output.len) break;
+                var acc: f32 = 0;
+                for (self.coeff, self.dec_hist) |c, h| acc += c * h;
+                output[produced] = acc;
+                produced += 1;
+            }
+        }
+        return produced;
+    }
+
+    pub fn interpolate(self: *Resampler3, input: []const f32, output: []f32) usize {
+        var produced: usize = 0;
+        for (input) |x| {
+            var sub: usize = 0;
+            while (sub < 3) : (sub += 1) {
+                const sample: f32 = if (sub == 0) x else 0;
+                var i: usize = 47;
+                while (i > 0) : (i -= 1) self.up_hist[i] = self.up_hist[i - 1];
+                self.up_hist[0] = sample;
+                if (produced >= output.len) return produced;
+                var acc: f32 = 0;
+                for (self.coeff, self.up_hist) |c, h| acc += c * h;
+                output[produced] = acc * 3;
+                produced += 1;
+            }
+        }
+        return produced;
+    }
+};
+
+pub fn rms(samples: []const f32) f32 {
+    if (samples.len == 0) return 0;
+    var acc: f32 = 0;
+    for (samples) |s| acc += s * s;
+    return @sqrt(acc / @as(f32, @floatFromInt(samples.len)));
+}
+
+pub fn rmsDb(samples: []const f32) f32 {
+    const r = rms(samples);
+    if (r < 1e-10) return -120;
+    return 20 * std.math.log10(r);
+}
+
+fn sine(freq: f32, n: usize, amp: f32, out: []f32) void {
+    for (0..n) |i| {
+        out[i] = amp * @sin(2 * std.math.pi * freq * @as(f32, @floatFromInt(i)) / sample_rate);
+    }
+}
+
+test "fft roundtrip" {
+    var real = [_]f32{0} ** 8;
+    var imag = [_]f32{0} ** 8;
+    real[0] = 1;
+    real[1] = -0.5;
+    real[2] = 0.25;
+    const orig = real;
+    fftRadix2(&real, &imag, false);
+    fftRadix2(&real, &imag, true);
+    for (orig, real) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-5);
+}
+
+test "highpass attenuates rumble" {
+    var hp = Biquad.highpass(sample_rate, 80, 0.707);
+    var low: [4800]f32 = undefined;
+    var high: [4800]f32 = undefined;
+    sine(30, low.len, 0.5, &low);
+    sine(1000, high.len, 0.5, &high);
+    for (&low) |*s| s.* = hp.process(s.*);
+    hp = Biquad.highpass(sample_rate, 80, 0.707);
+    for (&high) |*s| s.* = hp.process(s.*);
+    const low_r = rms(low[2400..]);
+    const high_r = rms(high[2400..]);
+    try std.testing.expect(high_r > low_r * 3);
+}
+
+test "limiter holds the ceiling" {
+    const lim = Limiter{};
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        const x = @sin(0.1 * @as(f32, @floatFromInt(i))) * 2.0;
+        try std.testing.expect(@abs(lim.process(x)) <= 0.981);
+    }
+}
+
+test "agc lifts quiet speech and ducks silence" {
+    var chain = Chain.init(false, false);
+    const n: usize = hop * 200;
+    var input = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(input);
+    var output = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(output);
+    @memset(input, 0);
+    sine(440, n / 2, 0.02, input[n / 4 ..][0 .. n / 2]);
+    chain.process(input, output);
+    const speech = rmsDb(output[n / 4 + 8000 .. n / 4 + n / 2]);
+    const pause = rmsDb(output[n - 4000 ..]);
+    try std.testing.expect(speech > -24 and speech < -12);
+    try std.testing.expect(pause < -45);
+}
+
+test "agc does not wind up on silence" {
+    var agc = Agc.init();
+    var frame = [_]f32{0} ** hop;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) agc.process(0, &frame);
+    try std.testing.expect(agc.makeup < 1.05);
+    try std.testing.expect(rms(&frame) < 1e-4);
+}
+
+test "denoise lowers stationary noise" {
+    var chain = Chain.init(true, false);
+    var rng = std.Random.DefaultPrng.init(7);
+    const rand = rng.random();
+    const n: usize = hop * 400;
+    var input = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(input);
+    var output = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(output);
+    for (input) |*s| s.* = (rand.float(f32) * 2 - 1) * 0.05;
+    chain.processLinear(input, output);
+    const in_r = rms(input[n / 2 ..]);
+    const out_r = rms(output[n / 2 ..]);
+    try std.testing.expect(out_r < in_r * 0.55);
+}
+
+test "dereverb shortens a synthetic tail" {
+    const n: usize = hop * 40;
+    var input = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(input);
+    @memset(input, 0);
+    input[hop] = 1;
+    input[hop + 2400] = 0.7;
+    input[hop + 4800] = 0.45;
+    var dry = Chain.init(false, false);
+    var wet = Chain.init(false, true);
+    var dry_out = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(dry_out);
+    var wet_out = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(wet_out);
+    dry.process(input, dry_out);
+    wet.process(input, wet_out);
+    const start = hop + 2000;
+    const end = hop + 7000;
+    try std.testing.expect(rms(wet_out[start..end]) < rms(dry_out[start..end]) * 0.85);
+}
+
+test "resampler keeps dc and a mid tone" {
+    var rs = Resampler3.init();
+    var dc_in = [_]f32{1} ** 4800;
+    var dc_out = [_]f32{0} ** 1600;
+    const nd = rs.decimate(&dc_in, &dc_out);
+    try std.testing.expect(nd > 1000);
+    var acc: f32 = 0;
+    for (dc_out[nd - 400 .. nd]) |s| acc += s;
+    try std.testing.expectApproxEqAbs(@as(f32, 1), acc / 400, 0.08);
+
+    var tone_in: [4800]f32 = undefined;
+    sine(1000, tone_in.len, 0.5, &tone_in);
+    var tone_down = [_]f32{0} ** 1600;
+    rs = Resampler3.init();
+    const nt = rs.decimate(&tone_in, &tone_down);
+    var up = [_]f32{0} ** 4800;
+    const nu = rs.interpolate(tone_down[0..nt], &up);
+    try std.testing.expect(nu > 3000);
+    try std.testing.expect(rms(up[nu / 2 .. nu]) > 0.15);
+}
