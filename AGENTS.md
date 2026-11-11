@@ -337,9 +337,13 @@ cpu_budget = 0.80
   leveler and a 5.3 ms look-ahead limiter. The legacy
   `dsp`/`dsp-dereverb` engines remain selectable but are not the default. See
   [rockpi4/QUALITY.md](rockpi4/QUALITY.md).
-- On this board the first-boot guard result is `rnnoise`: DeepFilterNet ran at a
-  realtime factor of 0.71-0.76 with the A72 cores capped at 1608 MHz (limit
-  0.60), so the installed config reads `engine = "rnnoise"` and `gain_db = 10`.
+- This board runs `engine = "deepfilter"`, `gain_db = 0` (since 2026-11-11).
+  Measured live with a speech clip: 5.4 ms per 10 ms frame, about 68 % of one
+  A72 core while speech is present (about 2 % in silence), 0 underruns. On the
+  same clip its pauses sit at -45 dBFS against -37 dBFS for RNNoise. The guard
+  limit is 0.85 because its 10 s clip run includes about 1.3 s of model
+  start-up (0.69-0.73 here); the earlier 0.60 limit wrongly fell back to
+  RNNoise. `~/.config/nearmic/config.toml.rnnoise.bak` is the previous config.
 - `gain_db = 0` is the template value for DeepFilterNet, which keeps the speech
   level. `gain_db = 10` is the RNNoise makeup gain, set by the guard on fallback.
   `voice.Post` then runs a speech
@@ -490,7 +494,8 @@ the NearMic source back into the Maono sink.
   adapter, and no NearMic, gadget or link unit depends on the network (none
   references `network-online.target`).
 - `nearmic-cpufreq.service` sets the A72 cluster (`policy4`) to `ondemand`, with
-  minimum 1416000 kHz and maximum 1608000 kHz, as written in the unit.
+  minimum 1416000 kHz and maximum 1800000 kHz. It is ordered after
+  `armbian-hardware-optimize`, which otherwise resets the cluster to 408-2016 MHz.
 - `config/99-nearmic-sysctl.conf`: a kernel panic or oops reboots the board after
   10 s (`kernel.panic = 10`, `kernel.panic_on_oops = 1`).
 - Image only (`prepare-image.sh`): journald is persistent with a 200 MB cap

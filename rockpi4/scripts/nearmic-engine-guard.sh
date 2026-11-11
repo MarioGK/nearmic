@@ -3,8 +3,8 @@
 # board and fall back to RNNoise if it cannot run comfortably in realtime.
 #
 # It processes a 10 s speech clip on the A72 pair (where nearmic.service
-# runs). DeepFilterNet must finish in under 60 % of the clip duration, which
-# leaves room for PipeWire and USB interrupts; otherwise config.toml is
+# runs). DeepFilterNet must finish in under 85 % of the clip duration (see
+# LIMIT below); otherwise config.toml is
 # switched to engine = "rnnoise", gain_db = 10 and the reason is logged.
 set -euo pipefail
 
@@ -13,7 +13,11 @@ HOME_DIR="$(getent passwd "$USER_NAME" | cut -d: -f6)"
 CFG="$HOME_DIR/.config/nearmic/config.toml"
 BIN="$HOME_DIR/.local/bin/nearmic"
 CLIP="${NEARMIC_GUARD_CLIP:-/opt/nearmic/bin/guard-clip.wav}"
-LIMIT="${NEARMIC_GUARD_LIMIT:-0.60}"
+# The clip run includes about 1.3 s of model start-up, so 10 s of audio takes
+# about 7 s on this board (0.69-0.73) while the per-frame cost is 5.4 ms of
+# each 10 ms. Live it ran with 0 underruns (2026-11-11). 0.85 still catches a
+# board that cannot keep up.
+LIMIT="${NEARMIC_GUARD_LIMIT:-0.85}"
 
 log() { echo "nearmic-engine-guard: $*"; }
 

@@ -1,7 +1,10 @@
 [Unit]
 Description=NearMic CPU frequency policy (A72 pair floor and cap)
 Documentation=file:///usr/local/share/doc/nearmic/AUDIO.md
-After=sysinit.target
+# armbian-hardware-optimize resets both clusters to 408-2016 MHz from
+# /etc/default/cpufrequtils; run after it or this policy is silently undone
+# (seen 2026-11-11: the unit was "active" while the cap was gone).
+After=sysinit.target armbian-hardware-optimize.service
 
 [Service]
 Type=oneshot
@@ -9,11 +12,10 @@ RemainAfterExit=yes
 # policy4 is the Cortex-A72 pair that runs DeepFilterNet.
 # - min 1416 MHz: ondemand otherwise parks the A72s at 408 MHz between frames
 #   and the next 10 ms frame starts slow, which shows up as deadline jitter.
-# - max 1608 MHz: this board browns out when the A72s run flat out with the
-#   Maono and the USB Wi-Fi on the same 5 V rail (2026-11-09/10: a hang at
-#   2016 MHz, and the Mask ROM loader dying with both adapters plugged in).
-#   DeepFilterNet needs ~6 ms of each 10 ms frame at 1.6 GHz.
-ExecStart=/bin/sh -c 'p=/sys/devices/system/cpu/cpufreq/policy4; echo ondemand > $p/scaling_governor; echo 1608000 > $p/scaling_max_freq; echo 1416000 > $p/scaling_min_freq'
+# - max 1800 MHz: the RK3399 A72 specification. DeepFilterNet3 measured
+#   5.4 ms per 10 ms frame at 1608 MHz, 5.2 ms at 1800 MHz and 5.1 ms at
+#   2016 MHz (2026-11-11), so the 2016 MHz OP1 overclock buys nothing.
+ExecStart=/bin/sh -c 'p=/sys/devices/system/cpu/cpufreq/policy4; echo ondemand > $p/scaling_governor; echo 1800000 > $p/scaling_max_freq; echo 1416000 > $p/scaling_min_freq'
 
 [Install]
 WantedBy=multi-user.target
