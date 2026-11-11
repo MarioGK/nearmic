@@ -5,7 +5,8 @@
 # the DSP; it only repairs the plumbing that a USB replug, a USB re-enumeration
 # or a PipeWire restart can break:
 #
-#   - the UAC2 gadget system service and its UDC
+#   - the UAC2 gadget system service and its UDC, including a USB link that
+#     did not re-enumerate after the computer woke up
 #   - the three user units (nearmic, both link supervisors)
 #   - the NearMic source actually streaming (an active unit can be stalled)
 #   - the UAC2 gadget as the WirePlumber default sink
@@ -28,6 +29,30 @@ log() { echo "nearmic-health: $*"; }
 # only hide that, and the gadget unit itself refuses to start. A reboot is the
 # only fix, and the operator has to schedule it.
 [ -e "/sys/class/udc/$GADGET" ] || exit 0
+
+# 0. The USB link to the computer. After the computer suspends and resumes,
+#    dwc3 can stay in "default"/"addressed": bus reset seen, never enumerated,
+#    so the computer has no NearMic device until something re-attaches it
+#    (seen 2026-11-11: gone from 15:49 until a manual re-attach at 18:04).
+#    If the link is in such a half-open state on two checks in a row, pulse
+#    the pull-up. "configured" is healthy; "suspended"/"not attached" mean the
+#    computer is asleep or unplugged and need nothing.
+UDC_STATE="$(cat "/sys/class/udc/$GADGET/state" 2>/dev/null || true)"
+UDC_FLAG="$XDG_RUNTIME_DIR/nearmic-udc-halfopen"
+case "$UDC_STATE" in
+default | addressed | powered | attached)
+	if [ -e "$UDC_FLAG" ]; then
+		log "USB link stuck in '$UDC_STATE'; re-attaching to the computer"
+		echo disconnect | sudo -n tee "/sys/class/udc/$GADGET/soft_connect" >/dev/null 2>&1
+		sleep 1
+		echo connect | sudo -n tee "/sys/class/udc/$GADGET/soft_connect" >/dev/null 2>&1
+		rm -f "$UDC_FLAG"
+	else
+		: >"$UDC_FLAG"
+	fi
+	;;
+*) rm -f "$UDC_FLAG" ;;
+esac
 
 # 1. System gadget unit. It is a oneshot with RemainAfterExit=yes, so it stays
 #    "active" unless it failed; a failed start after re-enumeration is the case

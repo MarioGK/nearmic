@@ -28,7 +28,9 @@ VID="${NEARMIC_VID:-0x1209}"       # pid.codes open-source vendor ID
 PID="${NEARMIC_PID:-0x4e4d}"       # private/demo product ID ("NM")
 SERIAL="${NEARMIC_SERIAL:-NEARMIC-0001}"
 MANUFACTURER="${NEARMIC_MANUFACTURER:-NearMic}"
-PRODUCT="${NEARMIC_PRODUCT:-NearMic USB Microphone}"
+# The computer builds its device names from this: "NearMic Mono" (input) and
+# "NearMic Analog Stereo" (output), instead of an output called "Microphone".
+PRODUCT="${NEARMIC_PRODUCT:-NearMic}"
 MAX_POWER="${NEARMIC_MAX_POWER:-500}" # mA; the board itself is on the USB-C PSU
 
 WANT_ACM=1

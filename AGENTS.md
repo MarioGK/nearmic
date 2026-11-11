@@ -72,8 +72,9 @@ host computer playback
 ```
 
 The host computer must not need a NearMic install. It sees a standard
-USB Audio Class 2 device (`1209:4e4d`, strings "NearMic") with one mono
-microphone and one stereo playback device.
+USB Audio Class 2 device (`1209:4e4d`, product string "NearMic") with one mono
+microphone and one stereo playback device. A PipeWire desktop lists them as
+"NearMic Mono" (input) and "NearMic Analog Stereo" (output).
 
 ## Board and network
 
@@ -465,6 +466,11 @@ the NearMic source back into the Maono sink.
   the gadget sink to volume 1.0: WirePlumber restored it at 0.46 once, which
   made the whole microphone quiet even though the DSP was at full level. It
   prints nothing while the board is healthy.
+- USB link self-repair (in `nearmic-health`): if the UDC sits in a half-open
+  state (`default`, `addressed`, `powered`, `attached`) on two checks in a
+  row, it pulses `soft_connect`. After the computer suspended and resumed on
+  2026-11-11 the link stayed in `default` and the computer had no NearMic
+  device for over two hours until it was re-attached.
 - `nearmic-gadget.service`: system oneshot, `RemainAfterExit=yes`,
   `Restart=no`. A failure means the overlay/UDC is wrong; restarting would
   hide it.
