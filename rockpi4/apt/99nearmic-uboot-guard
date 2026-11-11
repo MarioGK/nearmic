@@ -1,0 +1,3 @@
+// NearMic appliance: a bootloader package update must not bring back
+// U-Boot's USB-first boot order (see nearmic-uboot-guard).
+DPkg::Post-Invoke { "[ -x /usr/local/sbin/nearmic-uboot-guard ] && /usr/local/sbin/nearmic-uboot-guard || true"; };

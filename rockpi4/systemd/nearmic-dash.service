@@ -1,0 +1,20 @@
+[Unit]
+Description=NearMic console (live board and audio dashboard on port 80)
+Documentation=file:///usr/local/share/doc/nearmic/SETUP.md
+After=network.target user@1000.service
+Wants=user@1000.service
+
+[Service]
+Type=simple
+User=mariogk
+ExecStart=/usr/bin/python3 /usr/local/share/nearmic/dash/nearmic-dash.py
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+# Never compete with the audio threads: A53 cores only, low priority, capped.
+CPUAffinity=0-3
+Nice=10
+MemoryMax=96M
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

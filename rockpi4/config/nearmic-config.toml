@@ -4,10 +4,12 @@
 # profile = "rock-pi-plus" keeps the RK3399 budget at 0.80; RNNoise itself is
 # single-threaded, so threads = 1 is explicit.  The rock DSP pool remains
 # available for the legacy engines.
-# engine = "rnnoise" is the best full-band 48 kHz neural denoiser that builds
-# and runs on this aarch64 board today.  voice.Post adds a 75 Hz high-pass,
-# a gentle low shelf, a +2 dB presence shelf, a downward-only leveler and a
-# soft limiter.  See QUALITY.md for the LocalVQE/DPDFNet analysis.
+# engine = "deepfilter" is DeepFilterNet3 (full-band 48 kHz), embedded in the
+# binary and run on the two A72 cores; it keeps the speech level, so
+# gain_db = 0 (RNNoise needed 10).  engine = "rnnoise" is the lighter
+# fallback: 20 ms less delay, more residual noise, "robotic" on far speech.
+# voice.Post adds the closeness EQ, a speech leveler, a speech gate keyed on
+# the model's local SNR, and a look-ahead limiter.  See QUALITY.md.
 # listen = false keeps the processed voice out of the board speakers.
 #
 # source is the PipeWire node.name of the real USB microphone.  Leaving it
@@ -18,10 +20,10 @@
 # Example (Maono ProStudio 2x2 Lite):
 #   source = "alsa_input.usb-Maono_ProStudio_2x2_Lite_Maono_ProStudio_2x2_Lite-00.analog-stereo"
 profile = "rock-pi-plus"
-engine = "rnnoise"
+engine = "deepfilter"
 mode = "suppress"
 listen = false
-gain_db = 10
+gain_db = 0
 source = ""
 threads = 1
 cpu_budget = 0.80

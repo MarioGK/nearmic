@@ -3,3 +3,4 @@ work/
 *.img
 *.img.xz
 *.bin
+.env

@@ -14,6 +14,10 @@ ExecStart=%h/.local/bin/nearmic run
 Restart=always
 RestartSec=2
 Nice=-10
+# RK3399: CPUs 0-3 are Cortex-A53, 4-5 are Cortex-A72. DeepFilterNet runs its
+# encoder + DF decoder on the worker and the ERB decoder on a helper thread;
+# both need an A72 to finish a 10 ms frame in ~5 ms (an A53 takes ~11 ms).
+CPUAffinity=4 5
 # These limits only work if the user manager inherited a matching hard limit.
 # apply-appliance.sh installs /etc/security/limits.d/99-nearmic-limits.conf and
 # /etc/systemd/system/user@.service.d/99-nearmic-limits.conf for that reason.

@@ -1,0 +1,11 @@
+[Unit]
+Description=NearMic: keep U-Boot booting the eMMC before USB
+Documentation=file:///usr/local/share/doc/nearmic/SETUP.md
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nearmic-uboot-guard
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+[Unit]
+Description=NearMic Wi-Fi self-repair (never reboots the board)
+Documentation=file:///usr/local/share/doc/nearmic/SETUP.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nearmic-wifi-watchdog

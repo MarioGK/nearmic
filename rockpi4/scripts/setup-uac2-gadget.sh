@@ -31,6 +31,9 @@ MANUFACTURER="${NEARMIC_MANUFACTURER:-NearMic}"
 PRODUCT="${NEARMIC_PRODUCT:-NearMic USB Microphone}"
 MAX_POWER="${NEARMIC_MAX_POWER:-500}" # mA; the board itself is on the USB-C PSU
 
+WANT_ACM=1
+WANT_NCM=1
+
 log() { printf 'nearmic-gadget: %s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
 
@@ -57,6 +60,8 @@ load_modules() {
 	# Built-in on the Armbian 6.18 kernel, but harmless when modular.
 	modprobe libcomposite 2>/dev/null || true
 	modprobe usb_f_uac2 2>/dev/null || true
+	modprobe usb_f_acm 2>/dev/null || true
+	modprobe usb_f_ncm 2>/dev/null || true
 }
 
 dr_mode() {
@@ -117,7 +122,11 @@ cleanup_gadget() {
 	fi
 
 	rm -f "$GADGET_DIR/configs/c.1/uac2.usb0" 2>/dev/null || true
+	rm -f "$GADGET_DIR/configs/c.1/acm.usb0" 2>/dev/null || true
+	rm -f "$GADGET_DIR/configs/c.1/ncm.usb0" 2>/dev/null || true
 	rmdir "$GADGET_DIR/functions/uac2.usb0" 2>/dev/null || true
+	rmdir "$GADGET_DIR/functions/acm.usb0" 2>/dev/null || true
+	rmdir "$GADGET_DIR/functions/ncm.usb0" 2>/dev/null || true
 	rmdir "$GADGET_DIR/configs/c.1/strings/0x409" 2>/dev/null || true
 	rmdir "$GADGET_DIR/configs/c.1" 2>/dev/null || true
 	rmdir "$GADGET_DIR/strings/0x409" 2>/dev/null || true
@@ -155,16 +164,25 @@ configure_gadget() {
 	printf '%s\n' "2" >"$GADGET_DIR/functions/uac2.usb0/c_ssize"
 
 	ln -sfn "$GADGET_DIR/functions/uac2.usb0" "$GADGET_DIR/configs/c.1/uac2.usb0"
+
+	# Optional maintenance console (CDC-ACM, NEARMIC_ACM=1). It does not fit
+	# next to audio + network on this controller, so it is off by default.
+	if [ "$WANT_ACM" = 1 ] && mkdir -p "$GADGET_DIR/functions/acm.usb0" 2>/dev/null; then
+		ln -sfn "$GADGET_DIR/functions/acm.usb0" "$GADGET_DIR/configs/c.1/acm.usb0"
+	fi
+	# Maintenance network: CDC-NCM USB Ethernet. The board is 192.168.77.1
+	# (usb0, systemd-networkd DHCP server), so SSH works over this cable even
+	# without Wi-Fi. Fixed MACs keep the host interface name stable.
+	if [ "$WANT_NCM" = 1 ] && mkdir -p "$GADGET_DIR/functions/ncm.usb0" 2>/dev/null; then
+		printf '%s\n' "02:4e:4d:00:00:01" >"$GADGET_DIR/functions/ncm.usb0/dev_addr" 2>/dev/null || true
+		printf '%s\n' "02:4e:4d:00:00:02" >"$GADGET_DIR/functions/ncm.usb0/host_addr" 2>/dev/null || true
+		ln -sfn "$GADGET_DIR/functions/ncm.usb0" "$GADGET_DIR/configs/c.1/ncm.usb0"
+	fi
 }
 
 start_gadget() {
 	mount_configfs
 	load_modules
-	cleanup_gadget
-	configure_gadget
-
-	[ -d "$GADGET_DIR/functions/uac2.usb0" ] ||
-		die "usb_f_uac2 is unavailable; check CONFIG_USB_CONFIGFS_F_UAC2 and modprobe usb_f_uac2"
 
 	udc="$(find_udc)" || {
 		missing_udc_message
@@ -178,15 +196,31 @@ start_gadget() {
 		exit 1
 	fi
 
-	printf '%s\n' "$udc" >"$GADGET_DIR/UDC" || {
-		log "binding to ${udc} failed"
-		log "check: dmesg | tail -n 40; cat ${GADGET_DIR}/UDC"
-		exit 1
-	}
+	# The microphone must come up even if the controller cannot fit every
+	# function (endpoint budget) or a maintenance function is missing from the
+	# kernel: try audio+network+serial, then audio+network, then audio alone.
+	# The serial function is off by default: on this dwc3 the UDC refuses
+	# audio + network + serial together ("failed to start nearmic: -19", seen
+	# 2026-11-11), and an image without this fallback exposed no USB device.
+	for variant in "${NEARMIC_ACM:-0} ${NEARMIC_NCM:-1}" "0 ${NEARMIC_NCM:-1}" "0 0"; do
+		WANT_ACM="${variant% *}"
+		WANT_NCM="${variant#* }"
+		cleanup_gadget
+		configure_gadget
+		[ -d "$GADGET_DIR/functions/uac2.usb0" ] ||
+			die "usb_f_uac2 is unavailable; check CONFIG_USB_CONFIGFS_F_UAC2 and modprobe usb_f_uac2"
+		if printf '%s\n' "$udc" 2>/dev/null >"$GADGET_DIR/UDC"; then
+			log "UAC2 gadget bound to ${udc} (${VID}:${PID}, 48000 Hz S16_LE, serial=${WANT_ACM} network=${WANT_NCM})"
+			log "host side: mono microphone (capture) + stereo speaker (playback)"
+			log "board side: aplay -l / arecord -l (UAC2Gadget playback and capture)"
+			return 0
+		fi
+		log "binding to ${udc} failed with serial=${WANT_ACM} network=${WANT_NCM}; trying fewer functions"
+	done
 
-	log "UAC2 gadget bound to ${udc} (${VID}:${PID}, 48000 Hz S16_LE)"
-	log "host side: mono microphone (capture) + stereo speaker (playback)"
-	log "board side: aplay -l / arecord -l (UAC2Gadget playback and capture)"
+	log "binding to ${udc} failed"
+	log "check: dmesg | tail -n 40; cat ${GADGET_DIR}/UDC"
+	exit 1
 }
 
 check_state() {

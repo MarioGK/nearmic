@@ -9,7 +9,7 @@ USB microphone
   -> ROCK 4 Plus host USB port
   -> PipeWire source (alsa_input.usb-...)
   -> NearMic capture stream (nearmic-capture)
-  -> NearMic DSP (RNNoise + voice post, rock-pi-plus profile)
+  -> NearMic DSP (DeepFilterNet3, or RNNoise fallback, + voice post, rock-pi-plus profile)
   -> NearMic source (node.name "nearmic", capture_MONO)
   -> pw-link
   -> UAC2 gadget sink (ALSA UAC2Gadget, playback_MONO)
@@ -38,9 +38,9 @@ the NearMic microphone while monitoring computer audio.
 | Physical port | Controller | Role |
 | --- | --- | --- |
 | Upper USB 3.0 Type-A | OTG0, `usbdrd3_0`, `/usb@fe800000/usb@fe800000` | **Device/gadget** to the host computer |
-| Lower USB 3.0 Type-A | OTG1, `usbdrd3_1`, `/usb@fe900000/usb@fe900000` | Host, for the USB microphone |
-| USB 2.0 Type-A (two) | `usb_host0_*` / `usb_host1_*` (`fe380000`, `fe3c0000`) | Host, for the USB microphone |
-| USB-C | Power only | 5 V/3 A supply; never data |
+| Lower USB 3.0 Type-A | OTG1, `usbdrd3_1`, `/usb@fe900000/usb@fe900000` | Host, but **not for the Maono**: it failed to enumerate there (`error -71`, looping). Unused in the verified layout |
+| USB 2.0 Type-A (two) | `usb_host0_*` / `usb_host1_*` (`fe380000`, `fe3c0000`) | Host. Verified: TP-Link Wi-Fi on one, Maono on the other (stable) |
+| USB-C | Power only | 5 V/3 A supply (verified with a UGREEN 65 W charger); never data |
 
 **Check the physical OTG slide switch first.** ROCK 4A/4B boards have a small
 switch on the **underside below the USB ports**. It must be in **OTG/Device**
@@ -180,7 +180,27 @@ The script:
 On the board this creates an ALSA card named `UAC2Gadget` with a playback PCM
 (mono) and a capture PCM (stereo). On the host it creates a USB audio device
 with one mono capture stream (the microphone) and one stereo playback stream
-(the speaker), both 48 kHz S16_LE.
+(the speaker), both 48 kHz S16_LE. The host also sees the CDC-NCM maintenance
+function when it binds.
+
+### Maintenance functions (same cable)
+
+The same configuration `c.1` also carries a maintenance network:
+
+- `ncm.usb0`: CDC-NCM network (verified 2026-11-11). Board `usb0` is
+  `192.168.77.1/24` with a DHCP server for the host
+  (`network/30-nearmic-usb0.network`). The host gets a 192.168.77.x address and
+  uses `ssh mariogk@192.168.77.1`. Find the host interface with `ip -br link` by
+  MAC `02:4e:4d:00:00:02`; its name depends on the host port.
+- `acm.usb0`: CDC-ACM serial is **not available** on the verified build. The
+  dwc3 controller cannot bind UAC2 + NCM + ACM together (`udc fe800000.usb:
+  failed to start nearmic: -19`), so it is off by default (`NEARMIC_ACM=0`) and
+  no `/dev/ttyACM*` appears.
+
+The script tries the requested set, then audio + network, then audio only. A
+function the controller cannot bind never blocks the microphone.
+`NEARMIC_ACM=1` adds the serial function to the first attempt; `NEARMIC_NCM=0`
+leaves the network function out.
 
 Manual inspection:
 
@@ -188,6 +208,7 @@ Manual inspection:
 cat /sys/kernel/config/usb_gadget/nearmic/UDC
 cat /sys/kernel/config/usb_gadget/nearmic/functions/uac2.usb0/p_chmask
 cat /sys/kernel/config/usb_gadget/nearmic/functions/uac2.usb0/c_chmask
+ls /sys/kernel/config/usb_gadget/nearmic/configs/c.1/   # uac2.usb0, plus acm.usb0 and ncm.usb0 when bound
 aplay -l                  # UAC2Gadget playback (mic direction)
 arecord -l                # UAC2Gadget capture (headphone direction)
 cat /proc/asound/cards
@@ -700,6 +721,14 @@ restart loop outside that window is a bug; inspect the journal.
 5. `dmesg | grep -i dwc3` and
    `tr -d '\0' < /proc/device-tree/usb@fe800000/usb@fe800000/dr_mode`.
 
+### Board does not reach Linux with USB devices plugged in
+
+Check the U-Boot boot order first. Stock `boot_targets=usb0 mmc1 mmc0 ...`
+probes USB before the eMMC. On the board, `sudo /usr/local/sbin/nearmic-uboot-guard`
+reports whether the eMMC boot area and `u-boot.itb` are eMMC-first, and
+`nearmic-uboot-guard.service` re-applies it at boot. See
+[AGENTS.md](../AGENTS.md#boot-order).
+
 ### Gadget service fails
 
 ```sh
@@ -709,6 +738,9 @@ cat /sys/kernel/config/usb_gadget/nearmic/UDC 2>/dev/null
 ```
 
 - "no USB device controller": overlay/switch/reboot.
+- `failed to start nearmic: -19`: the controller rejected the function set
+  (UAC2 + NCM + ACM together). The script retries with fewer functions; the
+  verified board runs audio + NCM.
 - `write ... UDC: Device or resource busy`: another gadget is bound. Inspect
   `/sys/kernel/config/usb_gadget/*/UDC`; unbind the stale one or reboot.
 - `usb_f_uac2 is unavailable`: check `CONFIG_USB_CONFIGFS_F_UAC2=y` and
@@ -847,13 +879,25 @@ A 15 s failure is a real hang on this appliance.
 ### Reboot at 04:00
 
 `unattended-upgrades` reboots after applying upgrades. This is the maintenance
-window. The host sees the microphone disconnect. If that is unacceptable,
+window, at 04:00 local time (the board runs `America/Sao_Paulo`, copied from the
+workstation by `prepare-image.sh`). The host sees the microphone disconnect. If that is unacceptable,
 change `Unattended-Upgrade::Automatic-Reboot-Time` in
 `/etc/apt/apt.conf.d/50unattended-upgrades` as an operator decision.
 
 ## 10. 24/7 policy summary
 
-- Ethernet only. Do not change the HomeLab router.
+- Wi-Fi (`wlan0`, TP-Link USB adapter `2357:011e`) is the network path. Ethernet
+  is used only when a cable is plugged in. The USB maintenance link (`usb0`,
+  192.168.77.1) is present whenever the gadget binds. Do not change the HomeLab
+  router.
+- `nearmic-uboot-guard.service` at boot, and an apt hook after every dpkg run,
+  keep the eMMC first in the U-Boot boot order.
+- `apt-background.conf` keeps apt and unattended-upgrades on the A53 cores at
+  idle priority.
+- The Wi-Fi hotplug rule starts `netplan-wpa-wlan0` when `wlan0` appears;
+  `nearmic-wifi-watchdog` covers the rest.
+- `nearmic-dash` serves the NearMic Console on port 80. It samples only while a
+  browser is watching.
 - `loginctl enable-linger mariogk`; user PipeWire/WirePlumber/NearMic start at
   boot.
 - NearMic and the link supervisor restart automatically; the gadget does not
@@ -868,7 +912,7 @@ change `Unattended-Upgrade::Automatic-Reboot-Time` in
 
 ## 11. Related files
 
-- [`../AGENTS.md`](../AGENTS.md) — project/agent contract and safety rules
+- [`../AGENTS.md`](../AGENTS.md) — project/agent contract
 - [`SETUP.md`](SETUP.md) — file-to-destination map and installer usage
 - [`README.md`](README.md) — board image, network and hardware findings
 - [`scripts/setup-uac2-gadget.sh`](scripts/setup-uac2-gadget.sh)

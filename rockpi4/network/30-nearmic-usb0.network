@@ -1,0 +1,20 @@
+# USB maintenance link (CDC-NCM function of the NearMic gadget).
+# The host gets 192.168.77.x by DHCP; ssh mariogk@192.168.77.1.
+[Match]
+Name=usb0 usb1
+
+[Link]
+RequiredForOnline=no
+
+[Network]
+Address=192.168.77.1/24
+DHCPServer=yes
+ConfigureWithoutCarrier=yes
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+
+[DHCPServer]
+PoolOffset=10
+PoolSize=20
+EmitDNS=no
+EmitRouter=no

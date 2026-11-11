@@ -1,0 +1,21 @@
+[Unit]
+Description=NearMic first-boot provisioning (appliance install, no network needed)
+Documentation=file:///opt/nearmic/SETUP.md
+After=local-fs.target systemd-user-sessions.service nearmic-gadget.service
+ConditionPathExists=!/var/lib/nearmic/provisioned
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Packages are already in the image (prepare-image.sh); skip apt so the
+# install also works before Wi-Fi is up.
+Environment=NEARMIC_BINARY=/opt/nearmic/bin/nearmic
+ExecStart=/bin/bash -o pipefail -c '/opt/nearmic/scripts/apply-appliance.sh --apply --skip-packages 2>&1 | tee /var/log/nearmic-firstboot.log'
+# Time DeepFilterNet on this board; fall back to RNNoise if it is too slow.
+ExecStartPost=-/opt/nearmic/scripts/nearmic-engine-guard.sh
+ExecStartPost=-/bin/sh -c 'runuser -u mariogk -- env XDG_RUNTIME_DIR=/run/user/$$(id -u mariogk) systemctl --user restart nearmic.service'
+ExecStartPost=/bin/sh -c 'mkdir -p /var/lib/nearmic && date -Is > /var/lib/nearmic/provisioned'
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target

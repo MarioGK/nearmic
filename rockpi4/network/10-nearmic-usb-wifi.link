@@ -1,0 +1,9 @@
+# Name the first USB Wi-Fi adapter wlan0, whatever chip or MAC it has, so the
+# netplan Wi-Fi block (wlan0) matches any TP-Link dongle that is plugged in.
+[Match]
+Type=wlan
+Property=ID_BUS=usb
+
+[Link]
+Name=wlan0
+NamePolicy=

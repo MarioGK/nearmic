@@ -4,6 +4,47 @@ This file is the contract for an agent working in this repository and for the
 operator maintaining the board. Read it before changing deploy files, the
 board's audio graph, or its systemd units.
 
+## Agent autonomy
+
+The operator grants a standing, per-request-free mandate to operate this
+appliance end to end. An agent working here does not need to ask before:
+
+- editing anything in this repo, including `rockpi4/`, the docs and this file,
+  and committing the result;
+- deploying to `10.10.10.39` — `scp`/`rsync` the binary and deploy tree,
+  running `apply-appliance.sh` (dry run or `--apply`), and installing the
+  `unattended-upgrades`/`needrestart` policy;
+- restarting `nearmic`, `nearmic-link`, `nearmic-headphone-link`,
+  `nearmic-gadget`, or **PipeWire and WirePlumber**, and running
+  `wpctl`/`pw-link`/`systemctl` commands on the board;
+- **rebooting the board** or power-cycling it whenever a deploy, overlay,
+  kernel, watchdog or firmware change needs it, including outside the 04:00
+  window. Reboot, wait for it to come back, and verify the audio path
+  yourself;
+- running package operations **on the board** (`apt`, `dpkg`, `systemd-analyze`,
+  firmware tooling) when a deploy or diagnosis needs them;
+- installing, reloading or removing systemd units, udev rules, WirePlumber
+  fragments and kernel overlays on the board;
+- pushing the repo to its remote when the change is complete and verified.
+
+After any change, self-verify with the [verification commands](#verification-commands)
+and the health timer, fix what is broken, and only then report back. Prefer to
+act and confirm the result over asking a question that a verification command
+would answer.
+
+Two limits remain, because they are destructive or out of scope rather than
+operational: never write secrets, private keys or tokens into a tracked file,
+and never change the HomeLab router.
+
+Reflashing the eMMC is allowed as a last resort: when the board cannot be
+repaired over the network or the USB maintenance link. The operator authorized
+it on 2026-11-10 and 2026-11-11. Flash only an image built by
+`rockpi4/scripts/prepare-image.sh`, written with `rockpi4/scripts/rk.sh flash`.
+It needs one physical Mask ROM button press from the operator, so batch every
+change into a single flash. Never repartition the eMMC by hand. Procedure:
+[rockpi4/README.md](rockpi4/README.md#flashing-to-emmc-maskrom) and the
+`rockpi-flash` skill in `.claude/skills/`.
+
 ## Goal
 
 Turn a Radxa ROCK 4 Plus v1.73 into a 24/7 **USB microphone cleaner**:
@@ -12,7 +53,7 @@ Turn a Radxa ROCK 4 Plus v1.73 into a 24/7 **USB microphone cleaner**:
 USB microphone
   -> ROCK 4 Plus host USB port
   -> PipeWire
-  -> NearMic (Zig, RNNoise + voice post, rock-pi-plus profile)
+  -> NearMic (Zig, DeepFilterNet3 or RNNoise + voice post, rock-pi-plus profile)
   -> UAC2 USB gadget on the upper USB 3.0 Type-A OTG port
   -> host computer sees a USB microphone
 ```
@@ -42,27 +83,71 @@ microphone and one stereo playback device.
 | SoC | Rockchip OP1 / RK3399, 2x Cortex-A72 + 4x Cortex-A53, no NPU |
 | OS | Armbian 26.8.1, Debian 13 Trixie Minimal, kernel 6.18.44 |
 | Storage | 32 GB eMMC, root on `/dev/mmcblk0p1` |
-| Address | `10.10.10.36` (DHCP, VLAN 10) |
-| DNS | `rockpi-4bplus.homelab.lan` |
-| Network | Ethernet `end0`, 1 Gbps |
+| Address | `10.10.10.39` on Wi-Fi (DHCP, VLAN 10; may change) |
+| DNS | `rockpi-4bplus.homelab.lan`, mDNS `rockpi-4bplus.local` |
+| USB maintenance link | `192.168.77.1` (CDC-NCM, see [Maintenance access](#maintenance-access)) |
+| Network | Wi-Fi `wlan0` (USB adapter, netplan + networkd + wpa_supplicant); Ethernet `end0`, 1 Gbps, when a cable is plugged in |
+| Wi-Fi adapter | TP-Link Archer T2U Nano, USB `2357:011e`, RTL8811AU. In-kernel driver `rtw88_8821au`; firmware from `armbian-firmware-full`. Known limitation: signal at the board's location is weak (about -78 to -84 dBm on 5 GHz) |
 | Login | `mariogk`, SSH key, passwordless sudo |
 | Audio | PipeWire + WirePlumber as the `mariogk` user, 48 kHz |
 
-The board is wired only: Ethernet `end0` is the single network interface. See
-[rockpi4/README.md](rockpi4/README.md).
+The board has had no Ethernet cable since 2026-11-10 and joins Wi-Fi through a
+USB adapter. `rockpi4/network/10-nearmic-usb-wifi.link` names the adapter
+`wlan0`, and netplan configures it at image build time from `rockpi4/.env`
+(variables `WIFI_SSID`, `WIFI_PASS`, `WIFI_COUNTRY`; the file is git-ignored).
+Ethernet DHCP still works when a cable is plugged in. Command examples use
+`10.10.10.39`; substitute `rockpi-4bplus.local` or `192.168.77.1` (USB link)
+when that address differs. See [rockpi4/README.md](rockpi4/README.md).
 
 **Never write credentials, SSH private keys, tokens, or router passwords into
 a tracked file.** `rockpi4/credentials.txt` is local and git-ignored. Keep any
 generated credentials out of git.
+
+## Maintenance access
+
+When the gadget is up, the same A-to-A cable carries a composite USB device.
+Its audio part is unchanged: the host still sees `1209:4e4d` with one mono
+microphone and one stereo playback device. One maintenance function is bound:
+
+- **CDC-NCM network (verified 2026-11-11).** Board `usb0` is `192.168.77.1/24`
+  with a DHCP server for the host (`rockpi4/network/30-nearmic-usb0.network`).
+  The host gets a 192.168.77.x address by DHCP. Its interface name depends on
+  the host port: find it with `ip -br link` by MAC `02:4e:4d:00:00:02`. Then
+  `ssh mariogk@192.168.77.1`.
+- **No serial console.** The controller cannot bind audio + CDC-NCM + CDC-ACM
+  together: `udc fe800000.usb: failed to start nearmic: -19`. The serial
+  function is therefore off by default (`NEARMIC_ACM=0`), so no
+  `/dev/ttyACM*` appears. `NEARMIC_ACM=1` tries it first and falls back to
+  audio + NCM, then audio only, if the bind fails.
+
+The fallback order is audio + serial + network, then audio + network, then
+audio only. A maintenance function the kernel cannot bind never blocks the
+microphone. `usb0` exists only when the network function binds.
+
+## Dashboard
+
+The NearMic Console is a live page on port 80 of the board: CPU, memory,
+temperatures, network, units, USB devices, the NearMic status and a Maono input
+level meter. Open `http://10.10.10.39/` on Wi-Fi, or `http://192.168.77.1/` over
+the USB link.
+
+- Source: `rockpi4/dash/nearmic-dash.py` and `index.html`, installed to
+  `/usr/local/share/nearmic/dash/`. Standard library only.
+- Unit: `rockpi4/systemd/nearmic-dash.service`. Runs as `mariogk` with
+  `CAP_NET_BIND_SERVICE`, pinned to the A53 cores (`CPUAffinity=0-3`), `Nice=10`,
+  `MemoryMax=96M`, `Restart=always`.
+- Endpoints: `/` (the page), `/api` (JSON snapshot), `/levels` (input meter).
+- Sampling is idle by default. It samples only while a client asked for data in
+  the last 15 s, and the Maono meter (a `pw-record` tap) runs only then.
 
 ## Hardware topology and USB port map
 
 | Physical port | Controller / DT node | Role |
 | --- | --- | --- |
 | Upper USB 3.0 Type-A | OTG0, `usbdrd3_0`, `/usb@fe800000/usb@fe800000` | **Peripheral/gadget** to the host computer |
-| Lower USB 3.0 Type-A | OTG1, `usbdrd3_1`, `/usb@fe900000/usb@fe900000` | Host, for the USB microphone |
-| USB 2.0 Type-A ports | `usb_host0_*` / `usb_host1_*` (`fe380000`, `fe3c0000`) | Host, for the USB microphone |
-| USB-C | Power only | 5 V/3 A supply; not a data port |
+| Lower USB 3.0 Type-A | OTG1, `usbdrd3_1`, `/usb@fe900000/usb@fe900000` | Host, **not used for the Maono**: it failed to enumerate there (`error -71`, "unable to enumerate USB device", in a loop). Unused in the verified layout |
+| USB 2.0 Type-A ports | `usb_host0_*` / `usb_host1_*` (`fe380000`, `fe3c0000`) | Host. Verified layout: TP-Link Wi-Fi on one port, Maono on the other (stable) |
+| USB-C | Power only | 5 V/3 A supply (verified with a UGREEN 65 W USB-C charger); not a data port |
 
 The upper port is the Maskrom/OTG port. Use a **USB-A male to USB-A male data
 cable** from that port to the host computer. Use a normal USB cable for the
@@ -88,6 +173,36 @@ The stock Armbian DTB sets **both** dwc3 controllers to `dr_mode = "host"`, so
 The overlay only changes OTG0 to peripheral. The lower USB 3.0 port and the
 USB 2.0 ports remain host ports.
 
+### Boot order
+
+Cause, verified 2026-11-10/11: Armbian's U-Boot 2022.07 default is
+`boot_targets=usb0 mmc1 mmc0 nvme0 ...`, which probes USB before the eMMC. With
+the USB Wi-Fi adapter or the Maono interface plugged in at power-on, the board
+never reached Linux. Before the patch below it did not boot with those devices
+plugged in; with nothing plugged in it booted.
+
+Two layers keep the eMMC first:
+
+1. `rockpi4/scripts/prepare-image.sh` patches the default environment inside
+   `u-boot.itb` to `boot_targets=mmc1 mmc0 nvme0 usb0 ...` (same 47-byte
+   length). Image v3 was flashed this way.
+2. `nearmic-uboot-guard` (`rockpi4/scripts/nearmic-uboot-guard.py`) applies the
+   same patch to the eMMC boot area and to `/usr/lib/linux-u-boot-*/u-boot.itb`.
+   It runs from `nearmic-uboot-guard.service` at boot, and from the apt hook
+   `rockpi4/apt/99nearmic-uboot-guard` after every dpkg run. Verified: an
+   unattended upgrade replaced the u-boot package file with a stock copy, the
+   guard re-patched it, and the package upgrade did not change the on-disk
+   bootloader. A board gets the guard when `apply-appliance.sh --apply` runs.
+
+Test status: image v3 was flashed with `rockpi4/scripts/rk.sh flash` and booted
+with the TP-Link and the Maono plugged in. A warm reboot came back in about 25 s
+with Wi-Fi, audio routes and all units active. A **cold power-cycle with those
+devices attached has not been tested yet.**
+
+The SPI NOR flash is erased, so no SPI jumper is needed for Mask ROM or normal
+boot. Do not install the pin 23-25 jumper in normal operation.
+(`rockpi4/scripts/erase-spi.sh` is the erase procedure.)
+
 ## Repo layout
 
 | Path | Purpose |
@@ -98,7 +213,22 @@ USB 2.0 ports remain host ports.
 | `rockpi4/AUDIO.md` | Detailed gadget/PipeWire design and runbook |
 | `rockpi4/SETUP.md` | File-to-destination map and install steps |
 | `rockpi4/dtb/` | NearMic OTG overlay |
-| `rockpi4/scripts/setup-uac2-gadget.sh` | configfs UAC2 gadget setup/stop |
+| `rockpi4/scripts/setup-uac2-gadget.sh` | configfs duplex UAC2 gadget setup/stop; CDC-NCM maintenance network (CDC-ACM is tried first and dropped on the verified build) |
+| `rockpi4/scripts/prepare-image.sh` | Workstation: builds the self-provisioning eMMC image into `rockpi4/work/` |
+| `rockpi4/scripts/rk.sh` | Workstation: Mask ROM `wait`/`flash`/`backup`/`stress` over `rkdeveloptool` |
+| `rockpi4/.env` | Wi-Fi variables (`WIFI_SSID`, `WIFI_PASS`, `WIFI_COUNTRY`) read by `prepare-image.sh`; git-ignored |
+| `rockpi4/scripts/nearmic-engine-guard.sh` | First-boot check: keeps DeepFilterNet only if it runs in realtime, else RNNoise |
+| `rockpi4/scripts/nearmic-wifi-watchdog.sh` | Repairs the Wi-Fi link every 60 s; never reboots the board |
+| `rockpi4/systemd/nearmic-wifi-watchdog.{service,timer}` | Timer and oneshot for the Wi-Fi watchdog |
+| `rockpi4/systemd/nearmic-firstboot.service` | Runs `apply-appliance.sh` once on first boot, no network needed |
+| `rockpi4/systemd/nearmic-cpufreq.service` | A72 cluster frequency policy |
+| `rockpi4/network/`, `rockpi4/udev/` | Wi-Fi link name (`wlan0`), USB maintenance link addressing, Wi-Fi power save off; `70-nearmic-wifi.rules` starts `netplan-wpa-wlan0` when `wlan0` appears |
+| `rockpi4/dash/` | NearMic Console: `nearmic-dash.py` (stdlib HTTP server on port 80) and `index.html`; see [Dashboard](#dashboard) |
+| `rockpi4/systemd/nearmic-dash.service` | Dashboard unit: user `mariogk`, A53 cores, `Nice=10`, 96 MB cap |
+| `rockpi4/scripts/nearmic-uboot-guard.py` | Re-applies the eMMC-first U-Boot boot order at boot and after every dpkg run |
+| `rockpi4/systemd/nearmic-uboot-guard.service`, `rockpi4/apt/99nearmic-uboot-guard` | Boot unit and apt `DPkg::Post-Invoke` hook for the guard |
+| `rockpi4/systemd/apt-background.conf` | Drop-in for apt-daily, apt-daily-upgrade and unattended-upgrades: A53 cores, idle priority |
+| `rockpi4/config/99-nearmic-sysctl.conf` | Kernel panic and oops reboot after 10 s |
 | `rockpi4/scripts/nearmic-link.sh` | PipeWire source-to-gadget-sink supervisor; sets the gadget default sink and prunes foreign source links |
 | `rockpi4/scripts/nearmic-default-sink.sh` | `ExecStartPre` helper: UAC2 gadget default sink and 128-frame graph quantum |
 | `rockpi4/QUALITY.md` | RNNoise/LocalVQE/DPDFNet analysis, old robotic-chain root cause, measurements, build |
@@ -143,24 +273,25 @@ microphone's PipeWire `node.name`.
 
 ```sh
 # from the workstation
-ssh mariogk@10.10.10.36 'mkdir -p ~/.local/bin'
-scp zig-out/bin/nearmic mariogk@10.10.10.36:~/.local/bin/nearmic
-ssh mariogk@10.10.10.36 'chmod 0755 ~/.local/bin/nearmic'
+ssh mariogk@10.10.10.39 'mkdir -p ~/.local/bin'
+scp zig-out/bin/nearmic mariogk@10.10.10.39:~/.local/bin/nearmic
+ssh mariogk@10.10.10.39 'chmod 0755 ~/.local/bin/nearmic'
 
 # copy only the deploy tree (work/ is large and git-ignored)
 rsync -a --exclude work --exclude credentials.txt \
-  rockpi4/ mariogk@10.10.10.36:/tmp/nearmic-rockpi4/
+  rockpi4/ mariogk@10.10.10.39:/tmp/nearmic-rockpi4/
 
-# dry run first, then apply; no reboot is performed
-ssh mariogk@10.10.10.36 \
+# dry run first, then apply; --reboot reboots in the same step
+ssh mariogk@10.10.10.39 \
   'sudo /tmp/nearmic-rockpi4/scripts/apply-appliance.sh'
-ssh mariogk@10.10.10.36 \
-  'sudo /tmp/nearmic-rockpi4/scripts/apply-appliance.sh --apply'
+ssh mariogk@10.10.10.39 \
+  'sudo /tmp/nearmic-rockpi4/scripts/apply-appliance.sh --apply --reboot'
 ```
 
-If the overlay was just installed, reboot the board **only after coordination**
-(see safety rules). The gadget service will fail with a clear message until
-`/sys/class/udc/fe800000.usb` exists.
+If the overlay was just installed, reboot the board when the deploy needs it —
+no coordination round trip required — then verify `/sys/class/udc/fe800000.usb`
+and the gadget unit after it comes back. The gadget service will fail with a
+clear message until `/sys/class/udc/fe800000.usb` exists.
 
 Do not run `nearmic setup` after `apply-appliance.sh`: it rewrites
 `~/.config/systemd/user/nearmic.service` from `src/install.zig` and drops the
@@ -169,14 +300,15 @@ unit.
 
 ## NearMic profile
 
-`~/.config/nearmic/config.toml` on the board:
+`~/.config/nearmic/config.toml` on the board (template values; the engine notes
+below say what this board runs):
 
 ```toml
 profile = "rock-pi-plus"
-engine = "rnnoise"
+engine = "deepfilter"
 mode = "suppress"
 listen = false
-gain_db = 10
+gain_db = 0
 source = ""          # set to the USB mic's PipeWire node.name
 threads = 1
 cpu_budget = 0.80
@@ -184,14 +316,24 @@ cpu_budget = 0.80
 
 - `profile = "rock-pi-plus"` sets the RK3399 budget. RNNoise is single-threaded,
   so the appliance pins `threads = 1` and `cpu_budget = 0.80`; the user allows
-  up to 80 % CPU, but a heavier full-band model is not available on aarch64.
-- `engine = "rnnoise"` is the best full-band 48 kHz neural denoiser that builds
-  and runs on this board. `voice.Post` adds a 90 Hz high-pass, -2 dB low
+  up to 80 % CPU. DeepFilterNet3 runs on the two A72 cores; the engine guard
+  times it on cores 4 and 5.
+- `engine = "deepfilter"` is the template default: DeepFilterNet3, full-band
+  48 kHz, embedded in the binary. `nearmic-engine-guard.sh` runs once from
+  `nearmic-firstboot.service`, times a 10 s clip on cores 4-5, and keeps
+  DeepFilterNet only if its realtime factor is 0.60 or less. Otherwise it sets
+  `engine = "rnnoise"` and `gain_db = 10`. RNNoise is the fallback: about 20 ms
+  less delay, more residual noise, and robotic on far speech. `voice.Post` adds a 90 Hz high-pass, -2 dB low
   shelf, +4 dB presence peak, +2 dB air shelf, a presence-gated speech
   leveler and a 5.3 ms look-ahead limiter. The legacy
   `dsp`/`dsp-dereverb` engines remain selectable but are not the default. See
   [rockpi4/QUALITY.md](rockpi4/QUALITY.md).
-- `gain_db = 10` is the RNNoise makeup gain. `voice.Post` then runs a speech
+- On this board the first-boot guard result is `rnnoise`: DeepFilterNet ran at a
+  realtime factor of 0.71-0.76 with the A72 cores capped at 1608 MHz (limit
+  0.60), so the installed config reads `engine = "rnnoise"` and `gain_db = 10`.
+- `gain_db = 0` is the template value for DeepFilterNet, which keeps the speech
+  level. `gain_db = 10` is the RNNoise makeup gain, set by the guard on fallback.
+  `voice.Post` then runs a speech
   leveler (4:1 above -24 dBFS, up to +12 dB of presence-gated lift below it,
   per-sample gain ramping, +6 dB trim) and a look-ahead limiter at -2 dBFS.
   The limiter's 256-sample look-ahead is why the chain can be loud without
@@ -242,7 +384,7 @@ extra node.
 USB mic (host port)
   -> PipeWire source: alsa_input.usb-...
   -> nearmic-capture (PipeWire stream, mono F32 48 kHz)
-  -> NearMic worker: RNNoise + voice post, 480-sample frame
+  -> NearMic worker: DeepFilterNet3 (or RNNoise, 480-sample frame) + voice post
   -> NearMic source: node.name "nearmic", capture_MONO, mono F32 48 kHz
   -> nearmic-link (pw-link nearmic:capture_MONO <sink>:playback_MONO)
   -> UAC2 gadget sink: UAC2Gadget, playback_MONO, mono S16_LE 48 kHz
@@ -318,8 +460,34 @@ the NearMic source back into the Maono sink.
 - Do not run `powertop --auto-tune`; it re-enables USB autosuspend and can
   cause dropouts. Use a per-device udev rule if needed.
 - Maintenance reboot window is **04:00** local time, driven by
-  `unattended-upgrades`. The host will see the microphone disconnect during
-  that window.
+  `unattended-upgrades`. The board's timezone is `America/Sao_Paulo`, copied
+  from the workstation by `prepare-image.sh`, so this is 04:00 local and not
+  UTC. The host will see the microphone disconnect during that window.
+- `nearmic-wifi-watchdog.timer` runs every 60 s, first run 90 s after boot.
+  After 2 min without the Wi-Fi gateway it restarts `netplan-wpa-wlan0.service`
+  and reconfigures `wlan0`; after 5 min it runs `netplan apply`; after 10 min it
+  replugs the USB adapter. It never reboots the board and logs to the journal
+  with tag `nearmic-wifi`. It also keeps Wi-Fi power save off.
+  `rockpi4/udev/70-nearmic-wifi.rules` starts `netplan-wpa-wlan0.service` as soon
+  as `wlan0` appears, because netplan only pulls that unit in at boot; an
+  adapter plugged in later otherwise stayed unassociated.
+- `nearmic-uboot-guard.service`: oneshot at boot. It keeps the eMMC first in the
+  U-Boot boot order (see [Boot order](#boot-order)).
+- `rockpi4/systemd/apt-background.conf` drop-in on `apt-daily`,
+  `apt-daily-upgrade` and `unattended-upgrades`: `CPUAffinity=0-3`, `Nice=19`,
+  idle CPU and I/O class. An apt run was seen at 90 % on an A72 core that NearMic
+  uses.
+- A Wi-Fi outage never restarts audio. The watchdog touches only `wlan0` and its
+  adapter, and no NearMic, gadget or link unit depends on the network (none
+  references `network-online.target`).
+- `nearmic-cpufreq.service` sets the A72 cluster (`policy4`) to `ondemand`, with
+  minimum 1416000 kHz and maximum 1608000 kHz, as written in the unit.
+- `config/99-nearmic-sysctl.conf`: a kernel panic or oops reboots the board after
+  10 s (`kernel.panic = 10`, `kernel.panic_on_oops = 1`).
+- Image only (`prepare-image.sh`): journald is persistent with a 200 MB cap
+  (`SystemMaxUse=200M`), Armbian's 50 MB RAM log is disabled, and the kernel
+  command line gets `fsck.repair=yes` so a dirty filesystem never stops the boot
+  at a prompt.
 
 ## Latency budget
 
@@ -362,44 +530,26 @@ not for the lowest CPU. Measured on the board:
 - `/etc/needrestart/conf.d/99-nearmic.conf` — automatic service restarts after
   library upgrades, no interactive prompt.
 - `unattended-upgrades` and `needrestart` packages if missing.
+- `/etc/apt/apt.conf.d/99nearmic-uboot-guard` — re-applies the U-Boot boot order
+  after every dpkg run.
+- `/etc/systemd/system/{apt-daily,apt-daily-upgrade,unattended-upgrades}.service.d/99-nearmic-background.conf`
+  — keeps apt on the A53 cores at idle priority (`CPUAffinity=0-3`, `Nice=19`).
 
 This is intentionally aggressive for a dedicated appliance on a trusted LAN.
-Review enabled apt sources before adding third-party repositories. Do not
-disable the reboot policy without an operator decision.
-
-## Safety rules
-
-1. **No secrets.** Never add passwords, private keys, API tokens, or router
-   credentials to tracked files. `rockpi4/credentials.txt` stays local
-   and git-ignored. Report accidental secrets; do not commit them.
-2. **No HomeLab router changes.** Do not change DHCP reservations, VLANs,
-   firewall rules, DNS, or the HomeLab router. The board uses DHCP on VLAN 10.
-3. **No reboot without coordination.** The overlay and kernel/watchdog changes
-   need a reboot. Ask the operator first; the board is a 24/7 audio path.
-4. **No destructive changes without confirmation.** Do not repartition,
-   reflash eMMC, change the bootloader, remove `/boot/armbianEnv.txt`, or run
-   `rm -rf` on `/boot`, `/etc`, or the repo. Back up `armbianEnv.txt` before
-   editing; the installer does this as `armbianEnv.txt.nearmic.bak`.
-5. **Do not modify `src/` or `build.zig` for appliance work.** The DSP and
-   build gates are owned by the NearMic project; this task is deployment.
-6. **Do not run `apt` on the operator workstation.** Package installation
-   belongs on the board, through `apply-appliance.sh --apply`.
-7. **Do not apply board changes from an agent session without an explicit
-   instruction.** Writing repo files is safe; changing the live board is not.
-8. **Do not restart PipeWire casually.** Restarting `nearmic` and
-   `nearmic-link` is enough after config changes. A PipeWire restart can drop
-   all user audio.
-9. Keep the gadget and link units idempotent. Re-running the installer must not
-   create duplicate links or duplicate `user_overlays` entries.
-10. Keep the upper OTG port dedicated to the gadget. The microphone belongs on
-    a host port.
+The automatic reboot policy is deliberate and should stay enabled:
+`Automatic-Reboot`, `Automatic-Reboot-WithUsers` and
+`Automatic-Reboot-Time "04:00"` are all required, and
+`Automatic-Reboot-WithUsers "true"` is what makes the reboot happen even
+though `mariogk` holds a lingering session. Keep it that way when editing the
+policy, and re-apply the policy with `apply-appliance.sh --apply` after a
+change so the board converges without a manual step.
 
 ## Verification commands
 
 Board:
 
 ```sh
-ssh mariogk@10.10.10.36
+ssh mariogk@10.10.10.39
 
 # overlay / gadget (also check the physical OTG/Device slide switch)
 ls /sys/class/udc
@@ -424,6 +574,9 @@ journalctl --user -u nearmic -u nearmic-link -u nearmic-headphone-link -n 100 --
 # boot/apt/watchdog
 systemctl show -p RuntimeWatchdogUSec
 systemctl list-timers 'apt-daily*'
+
+# dashboard (Wi-Fi address; 192.168.77.1 over the USB link)
+curl -s http://10.10.10.39/api | head -c 300
 ```
 
 Host computer:
@@ -447,6 +600,20 @@ recording the gadget capture source while the host plays a tone:
 ```sh
 pw-record --target <uac2-source-node> --rate 48000 --channels 2 \
   --format s16 /tmp/headphone-test.wav
+```
+
+No network (the USB cable is the way in):
+
+```sh
+# host computer
+lsusb | grep 1209:4e4d
+ip -br link | grep -i 02:4e:4d:00:00:02   # host side of the CDC-NCM link
+ssh mariogk@192.168.77.1
+
+# board, when Wi-Fi is down
+networkctl status wlan0 --no-pager
+journalctl -t nearmic-wifi -n 50 --no-pager
+systemctl list-timers nearmic-wifi-watchdog.timer --no-pager
 ```
 
 If `nearmic doctor` reports `pipewire_library=missing`, rebuild the gnu

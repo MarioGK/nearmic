@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NearMic Console</title>
+<style>
+/* Layout: a mixing-desk meter bridge. One header strip, then a 4-column
+   panel grid that fills the viewport exactly; stacks to one column on phones. */
+:root {
+  color-scheme: dark;
+  --bg: #0b1114; --panel: #121b20; --panel-2: #18242a; --line: #23333b;
+  --fg: #e6eef0; --dim: #8aa0a8; --faint: #55686f;
+  --accent: #f2b23a;            /* VU amber */
+  --ok: #3fd08c; --warn: #f2b23a; --bad: #ff5d5d; --info: #4bb8e8;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --gap: 10px;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg); color: var(--fg); font: 13px/1.35 var(--sans);
+  display: flex; flex-direction: column; gap: var(--gap);
+  padding: var(--gap) max(12px, env(safe-area-inset-right, 0px)) var(--gap) max(12px, env(safe-area-inset-left, 0px));
+  font-variant-numeric: tabular-nums;
+}
+header {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 8px 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+}
+header h1 { font-size: 16px; margin: 0; letter-spacing: .02em; font-weight: 650; }
+header h1 span { color: var(--accent); }
+.hmeta { color: var(--dim); font-size: 12px; display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+.hmeta b { color: var(--fg); font-weight: 550; font-family: var(--mono); }
+.spacer { flex: 1; }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 99px;
+  font-size: 12px; font-weight: 600; border: 1px solid var(--line); background: var(--panel-2);
+}
+.pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+.pill.ok { color: var(--ok); } .pill.ok::before { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+.pill.warn { color: var(--warn); } .pill.warn::before { background: var(--warn); }
+.pill.bad { color: var(--bad); } .pill.bad::before { background: var(--bad); }
+
+main {
+  flex: 1; min-height: 0; display: grid; gap: var(--gap);
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-rows: repeat(3, minmax(0, 1fr));
+}
+section {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 6px; overflow: hidden;
+}
+section.wide { grid-column: span 2; }
+h2 {
+  margin: 0; font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--dim);
+  font-weight: 600; display: flex; justify-content: space-between; gap: 8px; align-items: baseline;
+}
+h2 em { font-style: normal; letter-spacing: 0; text-transform: none; color: var(--faint); font-family: var(--mono); font-size: 11px; }
+.big { font: 600 30px/1 var(--mono); letter-spacing: -.02em; }
+.big small { font-size: 13px; color: var(--dim); font-weight: 500; margin-left: 3px; }
+.row { display: flex; gap: 12px; align-items: flex-end; justify-content: space-between; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 12px; }
+.kv dt { color: var(--dim); } .kv dd { margin: 0; text-align: right; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+canvas { width: 100%; flex: 1; min-height: 24px; display: block; }
+.bar { height: 7px; background: var(--panel-2); border-radius: 4px; overflow: hidden; }
+.bar i { display: block; height: 100%; width: 0; background: var(--info); border-radius: 4px; transition: width .4s; }
+.cores { display: grid; grid-template-columns: repeat(6, 1fr); gap: 5px; align-items: end; height: 46px; }
+.core { display: flex; flex-direction: column; justify-content: flex-end; height: 100%; gap: 2px; }
+.core b { display: block; background: var(--info); border-radius: 2px 2px 0 0; min-height: 2px; transition: height .4s; }
+.core.big72 b { background: var(--accent); }
+.core span { font: 9.5px var(--mono); color: var(--faint); text-align: center; }
+.ok-t { color: var(--ok); } .warn-t { color: var(--warn); } .bad-t { color: var(--bad); } .dim { color: var(--dim); }
+
+/* audio meters */
+.meter { display: grid; grid-template-columns: 14px 1fr 52px; gap: 8px; align-items: center; font: 11px var(--mono); color: var(--dim); }
+.vu { position: relative; height: 12px; border-radius: 3px; background:
+  linear-gradient(90deg, #1f6f52 0 70%, #7a6220 70% 88%, #6e2a2a 88%); overflow: hidden; }
+.vu i { position: absolute; inset: 0 0 0 auto; background: var(--panel-2); width: 100%; transition: width .09s linear; }
+.vu u { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--fg); left: 0; transition: left .09s linear; }
+.scale { display: flex; justify-content: space-between; font: 9px var(--mono); color: var(--faint); margin: 0 60px 0 22px; }
+.path { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px; }
+.node { padding: 3px 8px; border-radius: 5px; background: var(--panel-2); border: 1px solid var(--line); white-space: nowrap; }
+.arrow { color: var(--faint); font-family: var(--mono); }
+.arrow.on { color: var(--ok); } .arrow.off { color: var(--bad); }
+.chips { display: flex; flex-wrap: wrap; gap: 5px; overflow: auto; }
+.chip { font: 11px var(--mono); padding: 2px 7px; border-radius: 4px; background: var(--panel-2); border-left: 3px solid var(--faint); white-space: nowrap; }
+.chip.ok { border-color: var(--ok); } .chip.bad { border-color: var(--bad); color: var(--bad); } .chip.warn { border-color: var(--warn); }
+ul.usb { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; font-size: 12px; overflow: auto; }
+ul.usb li { display: flex; justify-content: space-between; gap: 8px; }
+ul.usb li span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+ul.usb code { color: var(--faint); font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+.sig { display: inline-flex; gap: 2px; align-items: flex-end; height: 14px; vertical-align: -2px; margin-right: 6px; }
+.sig i { width: 4px; background: var(--line); border-radius: 1px; }
+.sig i.on { background: var(--ok); }
+#stale { display: none; color: var(--bad); font-weight: 600; }
+body.stale #stale { display: inline; }
+body.stale main { opacity: .55; }
+
+@media (max-width: 1100px) {
+  html, body { height: auto; }
+  main { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: none; grid-auto-rows: minmax(190px, auto); }
+}
+@media (max-width: 620px) {
+  main { grid-template-columns: minmax(0, 1fr); }
+  section.wide { grid-column: auto; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Near<span>Mic</span> Console</h1>
+  <div class="hmeta">
+    <span>host <b id="h-host">–</b></span>
+    <span>Wi-Fi <b id="h-ip">–</b></span>
+    <span>USB link <b id="h-usbip">–</b></span>
+    <span>up <b id="h-up">–</b></span>
+    <span id="h-os" class="dim"></span>
+  </div>
+  <div class="spacer"></div>
+  <span id="stale">no data from board</span>
+  <span class="pill" id="p-mic">microphone</span>
+  <span class="pill" id="p-host">computer link</span>
+  <span class="pill" id="p-sys">system</span>
+</header>
+
+<main>
+  <section>
+    <h2>CPU <em id="cpu-freq">–</em></h2>
+    <div class="row"><div class="big"><span id="cpu">0</span><small>%</small></div>
+      <div class="kv" style="font-size:11px"><dt>load</dt><dd id="load">–</dd><dt>pressure</dt><dd id="psi">–</dd></div></div>
+    <div class="cores" id="cores"></div>
+    <canvas id="c-cpu"></canvas>
+  </section>
+
+  <section>
+    <h2>Temperature <em>throttle at 85 °C</em></h2>
+    <div class="row"><div class="big"><span id="t-cpu">0</span><small>°C cpu</small></div>
+      <div class="big" style="font-size:20px"><span id="t-gpu">0</span><small>°C gpu</small></div></div>
+    <canvas id="c-temp"></canvas>
+  </section>
+
+  <section>
+    <h2>Memory <em id="mem-total">–</em></h2>
+    <div class="row"><div class="big"><span id="mem">0</span><small>% used</small></div>
+      <div class="kv" style="font-size:11px"><dt>used</dt><dd id="mem-used">–</dd><dt>cache</dt><dd id="mem-cache">–</dd><dt>swap</dt><dd id="swap">–</dd></div></div>
+    <div class="bar"><i id="mem-bar"></i></div>
+    <canvas id="c-mem"></canvas>
+  </section>
+
+  <section>
+    <h2>NearMic engine <em id="nm-pid">–</em></h2>
+    <div class="row"><div class="big" style="font-size:24px" id="nm-engine">–</div><span class="pill" id="nm-stream">–</span></div>
+    <dl class="kv">
+      <dt>mode</dt><dd id="nm-mode">–</dd>
+      <dt>board delay</dt><dd id="nm-delay">–</dd>
+      <dt>underruns</dt><dd id="nm-under">–</dd>
+      <dt>ring fill</dt><dd id="nm-fill">–</dd>
+      <dt>computer reading</dt><dd id="nm-rate">–</dd>
+      <dt>daemon CPU / RAM</dt><dd id="nm-cpu">–</dd>
+      <dt>graph quantum</dt><dd id="nm-quantum">–</dd>
+    </dl>
+  </section>
+
+  <section class="wide">
+    <h2>Audio input · Maono <em id="lv-state">meter idle</em></h2>
+    <div class="meter"><span>L</span><div class="vu"><i id="vu-l"></i><u id="pk-l"></u></div><span id="db-l">–</span></div>
+    <div class="meter"><span>R</span><div class="vu"><i id="vu-r"></i><u id="pk-r"></u></div><span id="db-r">–</span></div>
+    <div class="scale"><span>-60</span><span>-48</span><span>-36</span><span>-24</span><span>-12</span><span>0 dBFS</span></div>
+    <canvas id="c-lvl"></canvas>
+    <div class="path">
+      <span class="node">Maono mic</span><span class="arrow" id="a-src">──▶</span>
+      <span class="node">NearMic <span id="path-engine" class="dim"></span></span><span class="arrow" id="a-mic">──▶</span>
+      <span class="node">Computer mic</span>
+      <span style="flex:1"></span>
+      <span class="node">Computer audio</span><span class="arrow" id="a-hp">──▶</span><span class="node">Maono headphones</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Wi-Fi <em id="wf-ssid">–</em></h2>
+    <div class="row"><div class="big" style="font-size:24px"><span class="sig" id="wf-bars"><i style="height:4px"></i><i style="height:7px"></i><i style="height:10px"></i><i style="height:14px"></i></span><span id="wf-sig">–</span><small>dBm</small></div>
+      <div class="kv" style="font-size:11px"><dt>band</dt><dd id="wf-freq">–</dd><dt>link</dt><dd id="wf-rate">–</dd><dt>gateway</dt><dd id="wf-gw">–</dd></div></div>
+    <dl class="kv"><dt>down / up</dt><dd id="wf-io">–</dd><dt>self-repair</dt><dd id="wf-wd">–</dd></dl>
+    <canvas id="c-net"></canvas>
+  </section>
+
+  <section>
+    <h2>Storage · eMMC <em id="dk-total">–</em></h2>
+    <div class="row"><div class="big"><span id="dk">0</span><small>% used</small></div>
+      <div class="kv" style="font-size:11px"><dt>free</dt><dd id="dk-free">–</dd><dt>wear</dt><dd id="dk-life">–</dd></div></div>
+    <div class="bar"><i id="dk-bar"></i></div>
+    <dl class="kv"><dt>read / write</dt><dd id="dk-io">–</dd></dl>
+    <canvas id="c-disk"></canvas>
+  </section>
+
+  <section class="wide">
+    <h2>Services <em id="sv-failed">–</em></h2>
+    <div class="chips" id="units"></div>
+  </section>
+
+  <section>
+    <h2>USB devices <em id="udc">–</em></h2>
+    <ul class="usb" id="usb"></ul>
+  </section>
+
+  <section>
+    <h2>System</h2>
+    <dl class="kv">
+      <dt>board</dt><dd id="s-model">–</dd>
+      <dt>kernel</dt><dd id="s-kernel">–</dd>
+      <dt>watchdog</dt><dd id="s-wd">–</dd>
+      <dt>last auto-update</dt><dd id="s-upg">–</dd>
+      <dt>reboot pending</dt><dd id="s-reboot">–</dd>
+      <dt>maintenance window</dt><dd>04:00 daily</dd>
+      <dt>board time</dt><dd id="s-time">–</dd>
+    </dl>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const N = 120, hist = {cpu: [], tc: [], tg: [], mem: [], rx: [], tx: [], dr: [], dw: [], ll: [], lr: []};
+const push = (k, v) => { const a = hist[k]; a.push(v); if (a.length > N) a.shift(); };
+const bytes = (b, s = "") => { const u = ["B", "K", "M", "G", "T"]; let i = 0; while (b >= 1024 && i < 4) { b /= 1024; i++; } return (b >= 100 || i === 0 ? b.toFixed(0) : b.toFixed(1)) + " " + u[i] + (i ? "B" : "") + s; };
+const dur = s => { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m ${Math.floor(s % 60)}s`; };
+const set = (id, text, cls) => { const e = $(id); if (e.textContent !== String(text)) e.textContent = text; if (cls !== undefined) e.className = cls; };
+const pill = (id, level, text) => { const e = $(id); e.className = "pill " + level; e.textContent = text; };
+
+function spark(id, series, opt = {}) {
+  const c = $(id), r = c.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  if (r.width < 4 || r.height < 4) return;
+  if (c.width !== Math.round(r.width * dpr) || c.height !== Math.round(r.height * dpr)) { c.width = Math.round(r.width * dpr); c.height = Math.round(r.height * dpr); }
+  const g = c.getContext("2d"), W = c.width, H = c.height;
+  g.clearRect(0, 0, W, H);
+  g.strokeStyle = css("--line"); g.lineWidth = 1;
+  for (let i = 1; i < 4; i++) { const y = Math.round(H * i / 4) + .5; g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke(); }
+  let lo = opt.min ?? 0, hi = opt.max;
+  if (hi === undefined) hi = Math.max(opt.floor ?? 1, ...series.flatMap(s => s.data)) * 1.15;
+  series.forEach(s => {
+    const d = s.data; if (d.length < 2) return;
+    const x = i => W - (d.length - 1 - i) * (W / (N - 1)), y = v => H - 2 - (Math.min(hi, Math.max(lo, v)) - lo) / (hi - lo) * (H - 4);
+    g.beginPath(); d.forEach((v, i) => i ? g.lineTo(x(i), y(v)) : g.moveTo(x(i), y(v)));
+    g.strokeStyle = s.color; g.lineWidth = 1.6 * dpr; g.lineJoin = "round"; g.stroke();
+    if (s.fill) { g.lineTo(W, H); g.lineTo(x(0), H); g.closePath(); g.globalAlpha = .13; g.fillStyle = s.color; g.fill(); g.globalAlpha = 1; }
+    g.beginPath(); g.arc(W - 2 * dpr, y(d[d.length - 1]), 2.5 * dpr, 0, 7); g.fillStyle = s.color; g.fill();
+  });
+}
+
+const CORE = ["a53", "a53", "a53", "a53", "A72", "A72"];
+function render(d) {
+  if (!d.ts) return;
+  const info = d.info || {}, m = d.mem, nm = d.nearmic || {}, wf = d.wifi || {}, u = d.units || {}, rt = d.routes || {};
+  set("h-host", info.host || "–"); set("h-ip", wf.ip || "offline"); set("h-usbip", (wf.addrs || {}).usb0 || "–");
+  set("h-up", dur(d.uptime)); set("h-os", info.os || "");
+  // cpu
+  set("cpu", d.cpu.toFixed(0));
+  const cores = $("cores");
+  if (cores.children.length !== d.cores.length) cores.innerHTML = d.cores.map((_, i) => `<div class="core ${CORE[i] === "A72" ? "big72" : ""}"><b></b><span>${CORE[i] || "cpu"}</span></div>`).join("");
+  d.cores.forEach((v, i) => cores.children[i].firstChild.style.height = Math.max(3, v) + "%");
+  set("cpu-freq", `A53 ${d.freq.a53.cur} · A72 ${d.freq.a72.cur} MHz`);
+  set("load", d.load.map(x => x.toFixed(2)).join(" ")); set("psi", `cpu ${d.psi.cpu}% io ${d.psi.io}%`);
+  push("cpu", d.cpu); spark("c-cpu", [{data: hist.cpu, color: css("--info"), fill: 1}], {max: 100});
+  // temp
+  const tc = d.temps.cpu ?? 0, tg = d.temps.gpu ?? 0;
+  set("t-cpu", tc.toFixed(1), tc > 80 ? "bad-t" : tc > 70 ? "warn-t" : ""); set("t-gpu", tg.toFixed(1));
+  push("tc", tc); push("tg", tg);
+  spark("c-temp", [{data: hist.tg, color: css("--faint")}, {data: hist.tc, color: css("--accent"), fill: 1}], {min: 30, max: 90});
+  // memory
+  const used = m.total - m.avail, mp = 100 * used / m.total;
+  set("mem", mp.toFixed(0)); set("mem-total", bytes(m.total)); set("mem-used", bytes(used)); set("mem-cache", bytes(m.cached));
+  set("swap", m.swap_total ? bytes(m.swap_total - m.swap_free) + " / " + bytes(m.swap_total) : "none");
+  $("mem-bar").style.width = mp + "%"; push("mem", mp); spark("c-mem", [{data: hist.mem, color: css("--info"), fill: 1}], {max: 100});
+  // nearmic
+  const streaming = nm.streaming === "1", nmUp = u.nearmic === "active";
+  set("nm-engine", nm.engine || "–"); set("path-engine", nm.engine ? "· " + nm.engine : "");
+  pill("nm-stream", !nmUp ? "bad" : streaming ? "ok" : "warn", !nmUp ? "stopped" : streaming ? "streaming" : "idle");
+  set("nm-mode", nm.mode || "–");
+  set("nm-delay", nm.delay_samples ? (nm.delay_samples / 48).toFixed(1) + " ms" : "–");
+  set("nm-under", nm.underruns ?? "–", +nm.underruns > 0 ? "warn-t" : "ok-t");
+  set("nm-fill", nm.out_fill ? nm.out_fill + " frames" : "–");
+  set("nm-rate", nm.played_total_rate > 0 ? (nm.played_total_rate / 1000).toFixed(1) + " kHz" : "idle (no app recording)", nm.played_total_rate > 0 ? "ok-t" : "dim");
+  set("nm-cpu", d.nm_proc ? `${d.nm_proc.cpu}% · ${bytes(d.nm_proc.rss)}` : "–"); set("nm-pid", d.nm_proc ? "pid " + d.nm_proc.pid : "not running");
+  set("nm-quantum", (d.quantum || nm.graph_max_request || "–") + " frames");
+  // routes
+  $("a-src").className = "arrow " + (rt.maono_to_nearmic ? "on" : "off");
+  $("a-mic").className = "arrow " + (rt.mic_to_host ? "on" : "off");
+  $("a-hp").className = "arrow " + (rt.host_to_headphones ? "on" : "off");
+  // wifi
+  const w = d.net.wlan0 || {rx_rate: 0, tx_rate: 0}, sig = wf.signal;
+  set("wf-ssid", wf.ssid || "not connected"); set("wf-sig", sig ?? "–", sig == null ? "" : sig > -67 ? "ok-t" : sig > -78 ? "warn-t" : "bad-t");
+  const bars = sig == null ? 0 : sig > -60 ? 4 : sig > -70 ? 3 : sig > -80 ? 2 : 1;
+  [...$("wf-bars").children].forEach((b, i) => b.className = i < bars ? "on" : "");
+  set("wf-freq", wf.freq ? (wf.freq > 4000 ? "5 GHz" : "2.4 GHz") + " · " + wf.freq : "–");
+  set("wf-rate", wf.tx_bitrate ? `${wf.rx_bitrate || "?"}↓ ${wf.tx_bitrate}↑ Mb` : "–"); set("wf-gw", wf.gateway || "–");
+  set("wf-io", bytes(w.rx_rate, "/s") + " · " + bytes(w.tx_rate, "/s"));
+  set("wf-wd", d.wifi_fail ? `repairing (${d.wifi_fail} min down)` : "link healthy", d.wifi_fail ? "warn-t" : "ok-t");
+  push("rx", w.rx_rate); push("tx", w.tx_rate);
+  spark("c-net", [{data: hist.tx, color: css("--accent")}, {data: hist.rx, color: css("--ok"), fill: 1}], {floor: 2048});
+  // disk
+  const dp = 100 * (1 - d.disk.free / d.disk.total);
+  set("dk", dp.toFixed(0)); set("dk-total", bytes(d.disk.total)); set("dk-free", bytes(d.disk.free)); $("dk-bar").style.width = dp + "%";
+  const life = (d.emmc_life || "").split(" ").map(x => parseInt(x, 16)).filter(x => !isNaN(x));
+  set("dk-life", life.length ? `≤ ${Math.max(...life) * 10}% used` : "–");
+  set("dk-io", bytes(d.disk.read, "/s") + " · " + bytes(d.disk.write, "/s"));
+  push("dr", d.disk.read); push("dw", d.disk.write);
+  spark("c-disk", [{data: hist.dr, color: css("--info")}, {data: hist.dw, color: css("--accent"), fill: 1}], {floor: 65536});
+  // units
+  $("units").innerHTML = Object.entries(u).map(([k, v]) => `<span class="chip ${v === "active" ? "ok" : v === "activating" ? "warn" : "bad"}">${k.replace(".timer", " ⏱")} · ${v}</span>`).join("");
+  const failed = d.failed || [];
+  set("sv-failed", failed.length ? failed.length + " failed: " + failed.join(", ") : "none failed", failed.length ? "bad-t" : "");
+  // usb
+  $("usb").innerHTML = (d.usb || []).map(x => `<li><span>${x.name}</span><code>${x.id} · ${x.speed} Mb/s</code></li>`).join("") || '<li class="dim">nothing plugged in</li>';
+  set("udc", "to computer: " + d.udc, d.udc === "configured" ? "ok-t" : "warn-t");
+  // system
+  set("s-model", info.model || "–"); set("s-kernel", info.kernel || "–"); set("s-wd", info.watchdog || "off");
+  set("s-upg", d.last_upgrade ? new Date(d.last_upgrade * 1000).toLocaleString() : "not yet");
+  set("s-reboot", d.reboot_required ? "yes (tonight 04:00)" : "no", d.reboot_required ? "warn-t" : "");
+  set("s-time", new Date(d.ts * 1000).toLocaleTimeString());
+  // header pills
+  const micOk = nmUp && streaming && rt.maono_to_nearmic && rt.mic_to_host;
+  pill("p-mic", micOk ? "ok" : nmUp ? "warn" : "bad", micOk ? "microphone live" : !nmUp ? "NearMic stopped" : !rt.maono_to_nearmic ? "Maono not linked" : "mic not routed");
+  pill("p-host", d.udc === "configured" ? "ok" : "warn", d.udc === "configured" ? "computer connected" : "computer: " + d.udc);
+  const sysBad = failed.length || tc > 80, sysWarn = mp > 90 || dp > 90 || d.wifi_fail || +nm.underruns > 0;
+  pill("p-sys", sysBad ? "bad" : sysWarn ? "warn" : "ok", sysBad ? "needs attention" : sysWarn ? "check warnings" : "all healthy");
+}
+
+function renderLevels(l) {
+  const pos = db => Math.max(0, Math.min(100, (db + 60) / 60 * 100));
+  for (const ch of ["l", "r"]) {
+    $("vu-" + ch).style.width = (100 - pos(l[ch])) + "%"; $("pk-" + ch).style.left = `calc(${pos(l["p" + ch])}% - 2px)`;
+    set("db-" + ch, l.ok ? l[ch].toFixed(0) + " dB" : "–");
+  }
+  set("lv-state", l.ok ? "live · RMS bar, peak tick" : "meter starting…");
+  if (l.ok) { push("ll", l.l); push("lr", l.r); }
+}
+
+let last = 0;
+async function tick() {
+  try {
+    const r = await fetch("/api", {cache: "no-store"}); const d = await r.json();
+    if (d.ts) { render(d); last = Date.now(); }
+  } catch (e) {}
+  document.body.classList.toggle("stale", Date.now() - last > 5000);
+}
+async function tickLevels() {
+  try { const r = await fetch("/levels", {cache: "no-store"}); renderLevels(await r.json()); } catch (e) {}
+  spark("c-lvl", [{data: hist.lr, color: css("--faint")}, {data: hist.ll, color: css("--ok"), fill: 1}], {min: -70, max: 0});
+}
+tick(); setInterval(tick, 1000); setInterval(tickLevels, 150);
+</script>
+</body>
+</html>
