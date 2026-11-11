@@ -132,7 +132,7 @@ with the `rockpi-image` skill.
    and writes `rockpi4/work/nearmic-<date>.img`. Do not partition it by hand.
 2. Power off the board and remove microSD. Do **not** install the SPI jumper
    (pins 23-25). The SPI NOR is erased, so the board boots from the eMMC without
-   it (see [AGENTS.md](../AGENTS.md#boot-order)).
+   it (see [AGENTS.md](../AGENTS.md#boot-chain)).
 3. Connect a **USB-A male → USB-A male data cable** from the PC to the
    **upper USB 3.0 Type-A (OTG)** port. Power the board from its own 5 V/3 A
    USB-C supply, with nothing else on its USB ports: unplug the Wi-Fi adapter

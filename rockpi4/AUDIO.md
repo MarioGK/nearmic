@@ -727,7 +727,7 @@ Check the U-Boot boot order first. Stock `boot_targets=usb0 mmc1 mmc0 ...`
 probes USB before the eMMC. On the board, `sudo /usr/local/sbin/nearmic-uboot-guard`
 reports whether the eMMC boot area and `u-boot.itb` are eMMC-first, and
 `nearmic-uboot-guard.service` re-applies it at boot. See
-[AGENTS.md](../AGENTS.md#boot-order).
+[AGENTS.md](../AGENTS.md#boot-chain).
 
 ### Gadget service fails
 

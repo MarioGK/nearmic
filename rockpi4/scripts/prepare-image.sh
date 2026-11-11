@@ -30,7 +30,7 @@ TARGET_USER="${TARGET_USER:-mariogk}"
 TARGET_KEY="${TARGET_KEY:-$HOME/.ssh/id_ed25519.pub}"
 MIC_SOURCE="${MIC_SOURCE:-alsa_input.usb-Maono_ProStudio_2x2_Lite_Maono_ProStudio_2x2_Lite-00.analog-stereo}"
 PACKAGES=(pipewire wireplumber pipewire-audio alsa-utils unattended-upgrades needrestart
-	avahi-daemon libnss-mdns usb-modeswitch usb-modeswitch-data rfkill iputils-ping)
+	avahi-daemon libnss-mdns usb-modeswitch usb-modeswitch-data rfkill iputils-ping u-boot-tools)
 # armbian-firmware-full replaces armbian-firmware: every Wi-Fi blob Armbian
 # ships (rtw88/rtw89 incl. RTL8851B/8852B/C, mt76 incl. MT7921/7925, ath, aic8800),
 # so whichever TP-Link adapter is plugged in finds its firmware. It unpacks to
@@ -217,6 +217,27 @@ fi
 for f in "$ROOT"/usr/lib/linux-u-boot-*/u-boot.itb; do
 	[ -f "$f" ] && sudo bash -c "$(declare -f patch_uboot); patch_uboot '$f'"
 done
+
+# First boot stage: Rockchip's DDR init blob instead of U-Boot's open-source
+# TPL. With Armbian's stock idbloader (U-Boot TPL) this board hung before Linux
+# on many power-ups and resets (2026-11-10/11); with the blob in front of the
+# same SPL and U-Boot it passed 10 reboots and 5 forced resets in a row with
+# the Wi-Fi adapter and the Maono attached. This is Armbian's own
+# "tpl-blob" layout: mkimage -T rksd -d <ddr blob>:<u-boot-spl.bin>.
+DDR_BLOB="$WORK/rk3399_ddr_800MHz_v1.30.bin"
+DDR_URL="https://github.com/rockchip-linux/rkbin/raw/master/bin/rk33/rk3399_ddr_800MHz_v1.30.bin"
+DDR_SHA="2c74f7c0a2f7b1a49225fd0dca2fd88f574177e2b87dd4c526d569a94a9bcd92"
+[ -f "$DDR_BLOB" ] || curl -fL --retry 3 -o "$DDR_BLOB" "$DDR_URL"
+[ "$(sha256sum "$DDR_BLOB" | awk '{print $1}')" = "$DDR_SHA" ] || { echo "DDR blob SHA256 mismatch"; exit 1; }
+SPL="$(ls "$ROOT"/usr/lib/linux-u-boot-*/u-boot-spl.bin | head -n1)"
+sudo install -D -m 0644 "$DDR_BLOB" "$ROOT/usr/local/share/nearmic/boot/rk3399_ddr.bin"
+in_root mkimage -n rk3399 -T rksd -d "/usr/local/share/nearmic/boot/rk3399_ddr.bin:${SPL#"$ROOT"}" \
+	/usr/local/share/nearmic/boot/idbloader.img >/dev/null
+IDB="$ROOT/usr/local/share/nearmic/boot/idbloader.img"
+[ "$(stat -c %s "$IDB")" -lt $(( (16384 - 64) * 512 )) ] || { echo "idbloader too large"; exit 1; }
+sudo dd if=/dev/zero of="$LOOP" bs=512 seek=64 count=$((16384 - 64)) conv=notrunc status=none
+sudo dd if="$IDB" of="$LOOP" bs=512 seek=64 conv=notrunc,fsync status=none
+echo "idbloader: Rockchip DDR blob v1.30 + $(basename "$(dirname "$SPL")") SPL"
 
 echo "== boot: OTG overlay, fsck repair"
 ENV="$ROOT/boot/armbianEnv.txt"

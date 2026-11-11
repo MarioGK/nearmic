@@ -116,3 +116,25 @@ rockpi4/scripts/rk.sh maskrom         # loader already up: reboot into Mask ROM 
 
 Run `flash`/`stress` with Bash `run_in_background`, then tell the user the
 one physical step from rule 8. Building the image: see the `rockpi-image` skill.
+
+## Boot-chain fix (2026-11-11) — read before blaming power or cables
+
+The "solid green, no blue heartbeat, nothing on USB" hang was the **first boot
+stage**: Armbian's idbloader uses U-Boot's open-source TPL for DDR init, and on
+this board it hung intermittently (cold or warm, devices attached or not).
+Rockchip's DDR blob in front of the same SPL/U-Boot fixed it: 10/10 reboots and
+5/5 forced resets with both USB devices attached. See AGENTS.md "Boot chain".
+
+- Repair a board in that state in one Mask ROM session, without a full reflash:
+  `rockpi4/work/bootfix/recover.sh` (writes a 16 MiB boot area, verifies,
+  resets, waits for Linux; about 40 s). Rebuild the boot area with
+  `mkimage -n rk3399 -T rksd -d rk3399_ddr_800MHz_v1.30.bin:u-boot-spl.bin`
+  at sector 64, Armbian `u-boot.itb` at sector 16384.
+- A board whose idbloader the boot ROM rejects **enters Mask ROM by itself**
+  (no button): check `lsusb` for `2207:330c` before asking for a button press.
+- Diagnose offline before reflashing: read the first GBs with `rkdeveloptool
+  rl`, compare the first 16 MiB with the image, and check `dumpe2fs -h`
+  "Last mount time" to see whether Linux ever mounted the disk.
+- Never write a self-built mainline U-Boot blind (no serial console): the
+  2025.10 attempt did not boot.
+

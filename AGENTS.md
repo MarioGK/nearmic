@@ -173,31 +173,40 @@ The stock Armbian DTB sets **both** dwc3 controllers to `dr_mode = "host"`, so
 The overlay only changes OTG0 to peripheral. The lower USB 3.0 port and the
 USB 2.0 ports remain host ports.
 
-### Boot order
+### Boot chain
 
-Cause, verified 2026-11-10/11: Armbian's U-Boot 2022.07 default is
-`boot_targets=usb0 mmc1 mmc0 nvme0 ...`, which probes USB before the eMMC. With
-the USB Wi-Fi adapter or the Maono interface plugged in at power-on, the board
-never reached Linux. Before the patch below it did not boot with those devices
-plugged in; with nothing plugged in it booted.
+The board hung before Linux on many power-ups and resets on 2026-11-10/11
+(green LED on, blue heartbeat never starting, nothing on USB). Two changes to
+the boot chain are in place; the first is the one that fixed it.
 
-Two layers keep the eMMC first:
+1. **Rockchip DDR blob as the first stage (the fix).** Armbian's stock
+   `idbloader.img` for this board uses U-Boot's open-source TPL for memory
+   init. With it, identical software booted at 09:33 and then failed
+   repeatedly from 11:03, with and without USB devices attached, from cold
+   power-on and from a Mask ROM reset. The eMMC was read back in Mask ROM:
+   bootloader area and boot files were intact, and the filesystem had not been
+   mounted since 09:33. Replacing only that stage with
+   `rk3399_ddr_800MHz_v1.30.bin` (`mkimage -n rk3399 -T rksd -d
+   <blob>:u-boot-spl.bin`, Armbian's "tpl-blob" layout, same SPL and U-Boot)
+   gave: boot 24 s after the write, then 10 of 10 `systemctl reboot` and 5 of 5
+   forced resets (`sysrq b`/`c`), all with the TP-Link and the Maono plugged
+   in. `prepare-image.sh` builds this idbloader into the image and keeps a
+   copy in `/usr/local/share/nearmic/boot/`. The mechanism (marginal DDR
+   training on this v1.73 board) is inferred from that A/B result, not
+   observed on a serial console. **A cold power-cycle test is still pending.**
+2. **eMMC before USB.** Armbian's U-Boot 2022.07 default is
+   `boot_targets=usb0 mmc1 mmc0 nvme0 ...`. `prepare-image.sh` patches the
+   default environment inside `u-boot.itb` to `mmc1 mmc0 nvme0 usb0 ...` (same
+   length), and `nearmic-uboot-guard` re-applies it to the eMMC boot area and
+   to `/usr/lib/linux-u-boot-*/u-boot.itb` at boot and after every dpkg run.
+   This alone did not stop the hangs.
 
-1. `rockpi4/scripts/prepare-image.sh` patches the default environment inside
-   `u-boot.itb` to `boot_targets=mmc1 mmc0 nvme0 usb0 ...` (same 47-byte
-   length). Image v3 was flashed this way.
-2. `nearmic-uboot-guard` (`rockpi4/scripts/nearmic-uboot-guard.py`) applies the
-   same patch to the eMMC boot area and to `/usr/lib/linux-u-boot-*/u-boot.itb`.
-   It runs from `nearmic-uboot-guard.service` at boot, and from the apt hook
-   `rockpi4/apt/99nearmic-uboot-guard` after every dpkg run. Verified: an
-   unattended upgrade replaced the u-boot package file with a stock copy, the
-   guard re-patched it, and the package upgrade did not change the on-disk
-   bootloader. A board gets the guard when `apply-appliance.sh --apply` runs.
-
-Test status: image v3 was flashed with `rockpi4/scripts/rk.sh flash` and booted
-with the TP-Link and the Maono plugged in. A warm reboot came back in about 25 s
-with Wi-Fi, audio routes and all units active. A **cold power-cycle with those
-devices attached has not been tested yet.**
+Do not replace the bootloader with a self-built mainline U-Boot without a
+serial console: a 2025.10 build written on 2026-11-11 was not accepted by the
+boot ROM (the board dropped to Mask ROM) and had to be replaced over USB.
+A backup of the stock Armbian boot area is in
+`rockpi4/work/bootarea-armbian-2022.07.bin` and on the board in
+`/var/lib/nearmic/`.
 
 The SPI NOR flash is erased, so no SPI jumper is needed for Mask ROM or normal
 boot. Do not install the pin 23-25 jumper in normal operation.
@@ -472,7 +481,7 @@ the NearMic source back into the Maono sink.
   as `wlan0` appears, because netplan only pulls that unit in at boot; an
   adapter plugged in later otherwise stayed unassociated.
 - `nearmic-uboot-guard.service`: oneshot at boot. It keeps the eMMC first in the
-  U-Boot boot order (see [Boot order](#boot-order)).
+  U-Boot boot order (see [Boot chain](#boot-chain)).
 - `rockpi4/systemd/apt-background.conf` drop-in on `apt-daily`,
   `apt-daily-upgrade` and `unattended-upgrades`: `CPUAffinity=0-3`, `Nice=19`,
   idle CPU and I/O class. An apt run was seen at 90 % on an A72 core that NearMic
