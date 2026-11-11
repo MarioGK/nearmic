@@ -139,3 +139,32 @@ EQ problem, not a model problem.
   full-band model is not available in a portable aarch64 build.
 - The UAC2 gadget and Maono clocks are independent USB domains. The ASRC servo
   in NearMic absorbs the drift; do not remove it when changing the DSP.
+
+## 2026-11-11: DeepFilterNet3 live, and why it sounded robotic
+
+Scored with DNSMOS P.835 (`scripts/score-dnsmos.py`) on 45 s of the operator's
+own far-field speech recorded from the Maono (speech about -30 dBFS, room
+-55 dBFS):
+
+| Chain | SIG | BAK | OVRL | speech dBFS |
+| --- | ---: | ---: | ---: | ---: |
+| raw | 2.32 | 2.37 | 1.84 | -28.6 |
+| RNNoise + post | 3.05 | 3.80 | 2.71 | -17.2 |
+| DeepFilterNet3 + post (offline) | 3.38 | 4.10 | 3.12 | -17.1 |
+| DeepFilterNet3 + post, live path before the fix | 3.09 | 3.91 | 2.77 | -20.2 |
+| DeepFilterNet3 + post, live path after the fix | 3.37 | 4.10 | 3.11 | -17.5 |
+
+- The live path was worse than the same DSP offline because no audio thread
+  had realtime priority (see AGENTS.md, 24/7 policy). The live capture had 478
+  holes of 128-255 samples in 47 s; after `rt_group_sched=0` and the
+  `performance` governor the live result equals the offline one.
+- DeepFilterNet3 beats RNNoise by 0.4 OVRL on this voice. Attenuation limits
+  (12-30 dB), the post-filter and libDF's stage-skipping thresholds
+  (`DF_MIN_DB`, `DF_MAX_ERB_DB`, `DF_MAX_DF_DB`) changed the score by less
+  than 0.05; they stay available as environment switches.
+- Post chain defaults changed: gate depth -45 -> -20 dB (no dead air between
+  words, same score), leveler trim +6 -> +9 dB (speech -19.7 -> -17.1 dBFS).
+  `NEARMIC_GATE_DB`, `NEARMIC_TRIM_DB`, `NEARMIC_LIFT_DB` override them.
+- What still limits "sounds close": the room reverberation in the far-field
+  input. SIG stays near 3.4 for every setting tried.
+

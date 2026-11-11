@@ -151,4 +151,19 @@ if command -v wpctl >/dev/null 2>&1; then
 	fi
 fi
 
+# 9. The Maono output is the headphone passthrough. WirePlumber creates new
+#    sinks at 40 % (-24 dB); with the computer's own NearMic output also at
+#    its 40 % default the passthrough was 48 dB down, i.e. silent (2026-11-11).
+#    The board side is unity; the listening level is set on the computer and
+#    on the interface's headphone knob. A mute placed by the route guard
+#    (section 7) is left alone.
+if command -v wpctl >/dev/null 2>&1 && [ ! -e "$FLAG" ]; then
+	pw-cli ls Node 2>/dev/null | awk '
+		/^[[:space:]]*id [0-9]+,/ { id=$2; sub(/,.*/, "", id) }
+		/node.name = "alsa_output\.usb-Maono/ { print id }
+	' | while read -r id; do
+		wpctl set-volume "$id" 1.0 >/dev/null 2>&1 || true
+	done
+fi
+
 exit 0

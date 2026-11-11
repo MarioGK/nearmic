@@ -1,0 +1,230 @@
+diff --git i/libDF/src/bin/enhance_wav.rs w/libDF/src/bin/enhance_wav.rs
+index b375926..dccc7b4 100644
+--- i/libDF/src/bin/enhance_wav.rs
++++ w/libDF/src/bin/enhance_wav.rs
+@@ -130,6 +130,7 @@ fn main() -> Result<()> {
+         exit(2)
+     };
+     let mut model: DfTract = DfTract::new(df_params.clone(), &r_params)?;
++    if std::env::var_os("DF_PAR").is_some() { model.enable_parallel()?; }
+     let mut sr = model.sr;
+     let mut delay = model.fft_size - model.hop_size; // STFT delay
+     delay += model.lookahead * model.hop_size; // Add model latency due to lookahead
+diff --git i/libDF/src/capi.rs w/libDF/src/capi.rs
+index 37f9afd..5ea8ae5 100644
+--- i/libDF/src/capi.rs
++++ w/libDF/src/capi.rs
+@@ -32,10 +32,27 @@ impl DFState {
+         );
+         r_params = r_params.with_post_filter(0.0f32);  //post_filter_beta
+         r_params = r_params.with_mask_reduce(ReduceMask::MAX);  //reduce_mask
+-        let df_params =
+-            DfParams::new(PathBuf::from(model_path)).expect("Could not load model from path");
+-        let m =
++        // NearMic: libDF skips stages by local SNR. Below `min_db_thresh` it
++        // writes exact zeros (tiny holes at word edges on far, quiet speech),
++        // above `max_db_*` it skips a decoder. The defaults (-10/30/20 dB) can
++        // be overridden; -100/100/100 runs every stage on every frame.
++        let env_f32 = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok());
++        if let Some(v) = env_f32("DF_MIN_DB") { r_params.min_db_thresh = v; }
++        if let Some(v) = env_f32("DF_MAX_ERB_DB") { r_params.max_db_erb_thresh = v; }
++        if let Some(v) = env_f32("DF_MAX_DF_DB") { r_params.max_db_df_thresh = v; }
++        if let Some(v) = env_f32("DF_POST_BETA") { r_params = r_params.with_post_filter(v); }
++        let df_params = if model_path.is_empty() {
++            DfParams::default()
++        } else {
++            DfParams::new(PathBuf::from(model_path)).expect("Could not load model from path")
++        };
++        let mut m =
+             DfTract::new(df_params, &r_params).expect("Could not initialize DeepFilter runtime.");
++        if std::env::var("DF_THREADS").map(|v| v != "1").unwrap_or(true) {
++            if let Err(e) = m.enable_parallel() {
++                eprintln!("DeepFilterNet: parallel decoder disabled: {}", e);
++            }
++        }
+         DFState { m, logger }
+     }
+     /// Returns the next log message as String
+@@ -86,8 +103,7 @@ pub unsafe extern "C" fn df_create(
+     atten_lim: f32,
+     log_level: *const c_char,
+ ) -> *mut DFState {
+-    let c_str = CStr::from_ptr(path);
+-    let path = c_str.to_str().unwrap();
++    let path = if path.is_null() { "" } else { CStr::from_ptr(path).to_str().unwrap_or("") };
+     let log_level = if log_level.is_null() {
+         None
+     } else {
+diff --git i/libDF/src/tract.rs w/libDF/src/tract.rs
+index b39a987..97bc3af 100644
+--- i/libDF/src/tract.rs
++++ w/libDF/src/tract.rs
+@@ -227,6 +227,57 @@ pub struct DfTract {
+     rolling_spec_buf_y: VecDeque<Tensor>, // Enhanced stage 1 spec buf
+     rolling_spec_buf_x: VecDeque<Tensor>, // Noisy spec buf
+     skip_counter: usize,  // Increment when wanting to skip processing due to low RMS
++    par: ParSlot,         // Optional second thread running the ERB decoder
++}
++
++/// The ERB decoder and the DF decoder only depend on the encoder output, so
++/// they can run at the same time. `ParDec` owns a copy of the ERB decoder on a
++/// helper thread; the calling thread runs the DF decoder meanwhile. Frame
++/// results are identical to the serial path, with no extra latency.
++pub struct ParDec {
++    tx: std::sync::mpsc::SyncSender<Vec<Tensor>>,
++    rx: std::sync::mpsc::Receiver<Result<Tensor>>,
++}
++
++/// A cloned `DfTract` falls back to the serial decoder path.
++#[derive(Default)]
++pub struct ParSlot(Option<ParDec>);
++impl Clone for ParSlot {
++    fn clone(&self) -> Self {
++        ParSlot(None)
++    }
++}
++
++extern "C" {
++    fn sched_setscheduler(pid: i32, policy: i32, param: *const i32) -> i32;
++}
++
++impl ParDec {
++    fn spawn(plan: TypedSimplePlan<TypedModel>) -> Result<Self> {
++        let (tx, req_rx) = std::sync::mpsc::sync_channel::<Vec<Tensor>>(1);
++        let (resp_tx, rx) = std::sync::mpsc::sync_channel::<Result<Tensor>>(1);
++        // Same realtime class as the calling DSP worker, if the process may.
++        let prio: i32 = std::env::var("DF_RT_PRIO").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
++        std::thread::Builder::new().name("df-erb-dec".into()).spawn(move || {
++            if prio > 0 {
++                unsafe { sched_setscheduler(0, 1, &prio) };
++            }
++            let mut erb_dec = match TypedSimpleState::new(plan) {
++                Ok(s) => s,
++                Err(_) => return,
++            };
++            while let Ok(inputs) = req_rx.recv() {
++                let inputs: TVec<TValue> = inputs.into_iter().map(TValue::from).collect();
++                let out = erb_dec
++                    .run(inputs)
++                    .map(|mut m| m.pop().unwrap().into_tensor());
++                if resp_tx.send(out).is_err() {
++                    break;
++                }
++            }
++        })?;
++        Ok(ParDec { tx, rx })
++    }
+ }
+ 
+ #[cfg(all(not(feature = "capi"), feature = "default-model"))]
+@@ -358,6 +409,7 @@ impl DfTract {
+             post_filter: rp.post_filter,
+             post_filter_beta: rp.post_filter_beta,
+             skip_counter: 0,
++            par: ParSlot(None),
+         };
+         m.init()?;
+         #[cfg(feature = "timings")]
+@@ -397,6 +449,14 @@ impl DfTract {
+         };
+     }
+ 
++    /// Run the ERB decoder on a helper thread, in parallel with the DF decoder.
++    pub fn enable_parallel(&mut self) -> Result<()> {
++        if self.par.0.is_none() {
++            self.par = ParSlot(Some(ParDec::spawn(self.erb_dec.plan().clone())?));
++        }
++        Ok(())
++    }
++
+     pub fn init(&mut self) -> Result<()> {
+         let ch = self.ch;
+         let spec_shape = [ch, 1, 1, self.n_freqs, 2];
+@@ -457,6 +517,7 @@ impl DfTract {
+             );
+         }
+         // Run encoder
++        let t0 = std::time::Instant::now();
+         let mut enc_emb = self.enc.run(tvec!(
+             self.erb_buf.clone(),
+             TValue::from(self.cplx_buf.clone().into_tensor().permute_axes(&[0, 3, 1, 2])?)
+@@ -475,7 +536,28 @@ impl DfTract {
+             apply_df
+         );
+ 
+-        let m = if apply_gains {
++        let t1 = std::time::Instant::now();
++        let par_erb = if apply_gains {
++            if let Some(par) = self.par.0.as_ref() {
++                let inputs = vec![
++                    emb.clone().into_tensor(),
++                    enc_emb.pop().unwrap().into_tensor(), // e3
++                    enc_emb.pop().unwrap().into_tensor(), // e2
++                    enc_emb.pop().unwrap().into_tensor(), // e1
++                    enc_emb.pop().unwrap().into_tensor(), // e0
++                ];
++                par.tx.send(inputs).map_err(|_| anyhow::anyhow!("ERB decoder thread stopped"))?;
++                true
++            } else {
++                false
++            }
++        } else {
++            false
++        };
++
++        let m = if par_erb {
++            None
++        } else if apply_gains {
+             let dec_input = tvec!(
+                 emb.clone(),
+                 enc_emb.pop().unwrap(), // e3
+@@ -494,6 +576,7 @@ impl DfTract {
+             None
+         };
+ 
++        let t2 = std::time::Instant::now();
+         let coefs = if apply_df {
+             let mut coefs = self.df_dec.run(tvec!(emb, c0))?.pop().unwrap().into_tensor();
+             coefs.set_shape(&[ch, self.nb_df, self.df_order, 2])?;
+@@ -502,6 +585,18 @@ impl DfTract {
+             None
+         };
+ 
++        let m = if par_erb {
++            let par = self.par.0.as_ref().unwrap();
++            let mut m = par.rx.recv().map_err(|_| anyhow::anyhow!("ERB decoder thread stopped"))??;
++            m.remove_axis(1)?;
++            m.remove_axis(1)?;
++            Some(m)
++        } else {
++            m
++        };
++
++        let t3 = std::time::Instant::now();
++        prof::add(t1 - t0, t2 - t1, t3 - t2);
+         Ok((lsnr, m, coefs))
+     }
+ 
+@@ -1078,3 +1173,22 @@ pub fn tvalue_to_array_view_mut(x: &mut TValue) -> ArrayViewMutD<f32> {
+         }
+     }
+ }
++
++pub mod prof {
++    use std::cell::RefCell;
++    use std::time::Duration;
++    thread_local! { static P: RefCell<[f64; 7]> = RefCell::new([0.0; 7]); }
++    pub fn add(a: Duration, b: Duration, c: Duration) {
++        if std::env::var_os("DF_PROF").is_none() { return; }
++        P.with(|p| {
++            let mut p = p.borrow_mut();
++            let (a, b, c) = (a.as_secs_f64() * 1e3, b.as_secs_f64() * 1e3, c.as_secs_f64() * 1e3);
++            p[0] += 1.0; p[1] += a; p[2] += b; p[3] += c;
++            p[4] = p[4].max(a); p[5] = p[5].max(b); p[6] = p[6].max(a + b + c);
++            if p[0] as u64 % 200 == 0 {
++                let n = p[0];
++                eprintln!("prof n={} enc={:.2} erb={:.2} df={:.2} ms | max enc={:.2} erb={:.2} total={:.2}", n, p[1]/n, p[2]/n, p[3]/n, p[4], p[5], p[6]);
++            }
++        });
++    }
++}

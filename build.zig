@@ -41,6 +41,7 @@ const Bundle = struct {
     dpdf_inc: ?[]const u8 = null,
     fftw_a: ?[]const u8 = null,
     cpuinfo_o: ?[]const u8 = null,
+    deepfilter_a: ?[]const u8 = null,
 };
 
 fn fileExists(path: []const u8) bool {
@@ -81,6 +82,9 @@ fn findBundle(b: *std.Build) Bundle {
         "/usr/lib/x86_64-linux-gnu/libfftw3f.a",
         "/usr/lib/libfftw3f.a",
     });
+    const deepfilter_a = firstExisting(&.{
+        b.pathFromRoot("third_party/deepfilter/libdf.a"),
+    });
     // Either neural backend is enough. DPDFNet's shipped native runtime is
     // x86-64 AVX2 assembly, so an aarch64 bundle links RNNoise only.
     if (rnnoise_a == null and dpdf_a == null) {
@@ -106,6 +110,7 @@ fn findBundle(b: *std.Build) Bundle {
         .dpdf_inc = dpdf_inc,
         .fftw_a = fftw_a,
         .cpuinfo_o = if (dpdf_a != null) ensureCpuinfo(b) else null,
+        .deepfilter_a = deepfilter_a,
     };
 }
 
@@ -192,6 +197,7 @@ fn linkRuntime(
     opts.addOption(bool, "with_speex", host_speex);
     opts.addOption(bool, "with_rnnoise", bundle.rnnoise_a != null);
     opts.addOption(bool, "with_dpdfnet", bundle.dpdf_a != null);
+    opts.addOption(bool, "with_deepfilter", bundle.deepfilter_a != null);
     step.root_module.addOptions("build_options", opts);
     step.linkLibC();
     if (target.result.abi != .musl) {
@@ -224,6 +230,13 @@ fn linkRuntime(
             .flags = &.{"-std=c11"},
         });
         step.addObjectFile(.{ .cwd_relative = lib });
+    }
+    if (bundle.deepfilter_a) |lib| {
+        // Rust staticlib (DeepFilterNet3 + tract): needs pthread, dl, m and
+        // the unwinder from libgcc_s, all present in Debian's glibc.
+        step.addObjectFile(.{ .cwd_relative = lib });
+        step.linkSystemLibrary("pthread");
+        step.linkSystemLibrary("gcc_s");
     }
     if (bundle.dpdf_a) |lib| {
         step.addIncludePath(.{ .cwd_relative = bundle.dpdf_inc.? });

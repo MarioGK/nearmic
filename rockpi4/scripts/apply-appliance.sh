@@ -161,6 +161,28 @@ ensure_armbian_overlay() {
 }
 ensure_armbian_overlay
 
+# Kernel command line. rt_group_sched=0: the Armbian kernel is built with
+# CONFIG_RT_GROUP_SCHED, which with cgroup v2 refuses SCHED_FIFO to every
+# process outside the root cgroup, i.e. to PipeWire and NearMic ("SCHED_FIFO
+# not granted (PERM)"). Without realtime priority the audio graph missed about
+# four cycles a second and the microphone sounded robotic (2026-11-11).
+ensure_extraarg() {
+	local arg="$1" current
+	current="$(sed -n 's/^extraargs=//p' "$ARMBIAN_ENV" | tail -n 1)"
+	case " $current " in *" $arg "*) say "  $ARMBIAN_ENV extraargs already has $arg"; return 0 ;; esac
+	if [ "$APPLY" -eq 1 ]; then
+		if grep -q '^extraargs=' "$ARMBIAN_ENV"; then
+			sed -i "s|^extraargs=.*|extraargs=${current:+$current }$arg|" "$ARMBIAN_ENV"
+		else
+			printf 'extraargs=%s\n' "$arg" >>"$ARMBIAN_ENV"
+		fi
+		say "  added $arg to extraargs (takes effect after a reboot)"
+	else
+		say "  would add $arg to extraargs in $ARMBIAN_ENV"
+	fi
+}
+ensure_extraarg rt_group_sched=0
+
 # User-owned directory skeleton.  `install -D` below would otherwise create
 # ~/.local and ~/.config/systemd as root, and WirePlumber then cannot write
 # ~/.local/state (seen 2026-11-11: "wp-state: Permission denied").
@@ -228,6 +250,7 @@ for unit in apt-daily.service apt-daily-upgrade.service unattended-upgrades.serv
 done
 do_install "$SRC/config/99-nearmic-limits.conf" /etc/security/limits.d/99-nearmic-limits.conf 0644 root:root
 do_install "$SRC/config/99-nearmic-sysctl.conf" /etc/sysctl.d/99-nearmic.conf 0644 root:root
+do_install "$SRC/config/cpufrequtils" /etc/default/cpufrequtils 0644 root:root
 # Network files: USB Wi-Fi is always wlan0, power save off, and the USB
 # maintenance link (192.168.77.1) of the gadget's NCM function.
 do_install "$SRC/network/10-nearmic-usb-wifi.link" /etc/systemd/network/10-nearmic-usb-wifi.link 0644 root:root
@@ -248,7 +271,8 @@ else
 	warn "apt-daily timers are not installed; install unattended-upgrades first"
 fi
 run systemctl enable nearmic-gadget.service
-run systemctl enable --now nearmic-cpufreq.service || warn "could not start nearmic-cpufreq.service"
+run systemctl enable nearmic-cpufreq.service || warn "could not enable nearmic-cpufreq.service"
+run systemctl restart nearmic-cpufreq.service || warn "could not start nearmic-cpufreq.service"
 run systemctl enable --now nearmic-wifi-watchdog.timer || warn "could not start nearmic-wifi-watchdog.timer"
 run systemctl enable nearmic-uboot-guard.service || warn "could not enable nearmic-uboot-guard.service"
 run /usr/local/sbin/nearmic-uboot-guard || warn "U-Boot boot-order guard reported a problem"

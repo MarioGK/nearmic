@@ -16,6 +16,11 @@ const dsp = @import("dsp.zig");
 /// - a speech leveler holds close speech at a fixed level and lifts quiet
 ///   (far) speech by up to +12 dB, gated on speech presence so the noise
 ///   RNNoise removed is not lifted with it
+/// - a speech gate: between phrases the output fades by 20 dB, so the
+///   residual noise the leveler and makeup gain would lift stays out of the
+///   way without the hard on/off of a deep gate. It is keyed on the engine's own speech detector
+///   (RNNoise VAD, DeepFilterNet local SNR), which leads the audio by the
+///   model delay, so it opens before the first syllable
 /// - a look-ahead limiter at -2.0 dBFS catches peaks with 5.3 ms of look-ahead,
 ///   so the level can be loud without clipping or the flat-topped "popping"
 ///   sound of a limiter that reacts after the peak
@@ -25,25 +30,47 @@ pub const Post = struct {
     presence: dsp.Biquad,
     air: dsp.Biquad,
     leveler: Leveler,
+    gate: Gate,
     limiter: LookaheadLimiter,
     level: bool,
+    /// NEARMIC_NO_GATE=1 turns the gate off (A/B listening tests).
+    gate_on: bool,
+    /// The engine's speech detector is reliable enough to key the gate alone.
+    trust_vad: bool = false,
+
+    fn envDb(name: []const u8) ?f32 {
+        const v = std.posix.getenv(name) orelse return null;
+        return std.fmt.parseFloat(f32, v) catch null;
+    }
 
     pub fn init(level: bool) Post {
-        return .{
+        var post = Post{
             .highpass = dsp.Biquad.highpass(dsp.sample_rate, 90, 0.707),
             .low = dsp.Biquad.lowShelf(dsp.sample_rate, 300, -2.0),
             .presence = dsp.Biquad.peaking(dsp.sample_rate, 3200, 1.0, 4.0),
             .air = dsp.Biquad.highShelf(dsp.sample_rate, 8000, 2.0),
             .leveler = Leveler.init(),
+            .gate = Gate.init(),
             .limiter = .{ .ceiling = dsp.dbToLin(-2.0) },
             .level = level,
+            .gate_on = std.posix.getenv("NEARMIC_NO_GATE") == null,
         };
+        // Listening-test overrides (dB): gate depth, leveler trim and lift.
+        if (envDb("NEARMIC_GATE_DB")) |v| {
+            post.gate.closed_db = v;
+            post.gate.gain_db = v;
+        }
+        if (envDb("NEARMIC_TRIM_DB")) |v| post.leveler.trim = dsp.dbToLin(v);
+        if (envDb("NEARMIC_LIFT_DB")) |v| post.leveler.max_lift_db = v;
+        return post;
     }
 
     /// Samples of added latency from the look-ahead limiter.
     pub const latency: usize = 256;
 
-    pub fn process(self: *Post, samples: []f32) void {
+    /// `speech` is the engine's speech confidence (0..1) for the newest frame,
+    /// or a negative value when the engine has no detector.
+    pub fn process(self: *Post, samples: []f32, speech: f32) void {
         for (samples) |*s| {
             var x = self.highpass.process(s.*);
             x = self.low.process(x);
@@ -52,6 +79,16 @@ pub const Post = struct {
             s.* = x;
         }
         if (self.level) self.leveler.process(samples);
+        // RNNoise's VAD reads most room noise as speech (mean 0.94 on noisy
+        // clips), so the level-based presence must agree. DeepFilterNet's
+        // local SNR is clean enough on its own (see engines.lsnrToSpeech).
+        const key = if (speech < 0)
+            self.leveler.presence
+        else if (self.trust_vad)
+            speech
+        else
+            @min(speech, self.leveler.presence);
+        if (self.gate_on) self.gate.process(samples, key);
         self.limiter.process(samples);
         // Safety clamp: the look-ahead limiter should already hold the peak at
         // `ceiling`, and this makes a single overshoot impossible (it only
@@ -67,15 +104,21 @@ pub const Post = struct {
 /// - 1:1 lift below it, capped at +12 dB, scaled by how far the level sits
 ///   above the tracked noise floor (silence and room tone stay at unity)
 /// - 60 ms detector, 10 ms attack / 300 ms release, gain ramped per sample
-/// - a +6 dB trim so the voice sits at a normal call level
+/// - a +9 dB trim so the voice sits at a normal call level
 pub const Leveler = struct {
     threshold_db: f32 = -24,
     ratio: f32 = 4.0,
     max_lift_db: f32 = 12,
-    trim: f32 = 1.995, // +6 dB
+    trim: f32 = 2.818, // +9 dB: far speech lands near -17 dBFS instead of -20
     envelope: f32 = 0,
     floor: f32 = 0,
     gain: f32 = 1,
+    presence: f32 = 0,
+
+    /// -80 dBFS (mean square). Neural engines output exact zeros in silence;
+    /// without a lower bound the floor collapses to zero, re-seeds on the next
+    /// block (often a speech onset) and then reads that speech as "floor".
+    const min_floor: f32 = 1e-8;
 
     pub fn init() Leveler {
         return .{};
@@ -100,9 +143,9 @@ pub const Leveler = struct {
         // minimum, rise over ~15 s. A slow rise keeps a sustained talker from
         // being absorbed into the floor.
         if (self.floor <= 1e-12) {
-            self.floor = ms;
+            self.floor = @max(ms, min_floor);
         } else if (ms < self.floor) {
-            self.floor = ms;
+            self.floor = @max(ms, min_floor);
         } else {
             self.floor += coeff(15.0, samples.len) * (ms - self.floor);
         }
@@ -115,6 +158,7 @@ pub const Leveler = struct {
             presence = 1;
         }
 
+        self.presence = presence;
         const level = @sqrt(self.envelope);
         var desired: f32 = self.trim;
         if (level > 1e-9) {
@@ -140,6 +184,59 @@ pub const Leveler = struct {
         for (samples, 0..) |*s, i| {
             const t = @as(f32, @floatFromInt(i + 1)) / n;
             s.* *= start + (end - start) * t;
+        }
+    }
+};
+
+/// Speech gate (downward expander with hysteresis and hold).
+///
+/// Opens within one hop when `speech` reaches `open_at`, stays open while it
+/// is at least `keep_at`, holds for `hold_s` after the last speech frame, then
+/// fades to `closed` over `release_s`. The fade is linear in dB, so word
+/// tails and room decay go down smoothly instead of being chopped.
+pub const Gate = struct {
+    open_at: f32 = 0.5,
+    keep_at: f32 = 0.35,
+    hold_s: f32 = 0.30,
+    release_s: f32 = 0.15,
+    // -20 dB, not a hard mute: with the model already removing the noise, a
+    // deeper gate only adds audible on/off "dead air" between words. On the
+    // operator's far-field recording DNSMOS is the same at -20 and -45.
+    closed_db: f32 = -20,
+    hold_left: f32 = 0,
+    gain_db: f32 = -20,
+
+    pub fn init() Gate {
+        return .{};
+    }
+
+    pub fn process(self: *Gate, samples: []f32, speech: f32) void {
+        if (samples.len == 0) return;
+        const block = @as(f32, @floatFromInt(samples.len)) / dsp.sample_rate;
+        const open = self.hold_left > 0;
+        if (speech >= self.open_at or (open and speech >= self.keep_at)) {
+            self.hold_left = self.hold_s;
+        } else {
+            self.hold_left = @max(0, self.hold_left - block);
+        }
+
+        const start_db = self.gain_db;
+        if (self.hold_left > 0) {
+            // Attack within this hop. The detector leads the audio by the
+            // model delay (10-30 ms), so the onset is already inside.
+            self.gain_db = 0;
+        } else {
+            const step = -self.closed_db * block / self.release_s;
+            self.gain_db = @max(self.closed_db, self.gain_db - step);
+        }
+        if (start_db == 0 and self.gain_db == 0) return;
+
+        const g0 = dsp.dbToLin(start_db);
+        const g1 = dsp.dbToLin(self.gain_db);
+        const n = @as(f32, @floatFromInt(samples.len));
+        for (samples, 0..) |*s, i| {
+            const t = @as(f32, @floatFromInt(i + 1)) / n;
+            s.* *= g0 + (g1 - g0) * t;
         }
     }
 };
@@ -217,8 +314,8 @@ test "leveler compresses loud speech and ramps smoothly" {
         for (&hop, 0..) |*s, i| s.* = 0.001 * @sin(@as(f32, @floatFromInt(i)) * 0.1);
         lv.process(&hop);
     }
-    // Only the +6 dB trim should be applied to steady room tone.
-    try std.testing.expectApproxEqAbs(@as(f32, 1.995), lv.gain, 0.12);
+    // Only the trim should be applied to steady room tone.
+    try std.testing.expectApproxEqAbs(lv.trim, lv.gain, 0.12 * lv.trim / 1.995);
 
     // Loud speech: gain comes down, output stays controlled.
     n = 0;
@@ -226,7 +323,7 @@ test "leveler compresses loud speech and ramps smoothly" {
         for (&hop, 0..) |*s, i| s.* = 0.6 * @sin(@as(f32, @floatFromInt(i)) * 0.1);
         lv.process(&hop);
     }
-    try std.testing.expect(lv.gain < 0.5);
+    try std.testing.expect(lv.gain < 0.5 * lv.trim / 1.995);
     try std.testing.expect(lv.gain > 0.02);
 }
 
@@ -246,7 +343,7 @@ test "leveler lifts far speech by at most 12 dB over the noise floor" {
         lv.process(&hop);
     }
     try std.testing.expect(lv.gain > 1.0);
-    try std.testing.expect(lv.gain <= dsp.dbToLin(12.0) * 1.995 + 1e-3);
+    try std.testing.expect(lv.gain <= dsp.dbToLin(12.0) * lv.trim + 1e-3);
 }
 
 test "limiter never exceeds the ceiling even on a step" {
@@ -264,4 +361,44 @@ test "limiter never exceeds the ceiling even on a step" {
         for (block) |s| peak = @max(peak, @abs(s));
     }
     try std.testing.expect(peak <= dsp.dbToLin(-2.0) + 1e-4);
+}
+
+test "gate opens on speech, holds, then fades to the closed level" {
+    var gate = Gate.init();
+    var block: [dsp.hop]f32 = undefined;
+
+    // Noise only: stays closed.
+    var n: usize = 0;
+    while (n < 50) : (n += 1) {
+        @memset(&block, 0.01);
+        gate.process(&block, 0.1);
+    }
+    try std.testing.expectApproxEqAbs(0.01 * dsp.dbToLin((Gate{}).closed_db), block[block.len - 1], 1e-6);
+
+    // Speech: fully open by the end of the first hop.
+    @memset(&block, 0.5);
+    gate.process(&block, 0.9);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), block[block.len - 1], 1e-5);
+
+    // Speech confidence drops below open but stays above keep: still open.
+    n = 0;
+    while (n < 200) : (n += 1) {
+        @memset(&block, 0.5);
+        gate.process(&block, 0.4);
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), block[0], 1e-5);
+
+    // Silence: open for the hold (~56 hops), closed after hold + release.
+    n = 0;
+    while (n < 50) : (n += 1) {
+        @memset(&block, 0.5);
+        gate.process(&block, 0);
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), block[0], 1e-5);
+    n = 0;
+    while (n < 40) : (n += 1) {
+        @memset(&block, 0.5);
+        gate.process(&block, 0);
+    }
+    try std.testing.expectApproxEqAbs(0.5 * dsp.dbToLin((Gate{}).closed_db), block[block.len - 1], 1e-5);
 }

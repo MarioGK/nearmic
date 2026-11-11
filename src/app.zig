@@ -25,6 +25,8 @@ extern fn nm_max_request() u32;
 extern fn nm_missing() u64;
 extern fn nm_out_take_refill() u32;
 extern fn nm_out_level() u32;
+extern fn nm_in_level() u32;
+extern fn nm_in_drop(n: u32) u32;
 extern fn nm_in_total() u64;
 extern fn nm_out_total() u64;
 extern fn nm_played_total() u64;
@@ -140,10 +142,16 @@ fn worker(app: *App) void {
     var silence: [512]f32 = .{0} ** 512;
     // Drift servo: the ring fill is the integral of the clock difference, so
     // a proportional ratio correction is a first-order loop with no overshoot.
-    // Proportional drift servo on the output reserve. The reserve is latency:
-    // keep it near 21 ms; the servo settles around 75 % of target. Measured deficit is 0.51%, which this loop still
-    // absorbs inside the 0.985-1.015 ratio clamp.
-    const target: f64 = 1024;
+    // The reserve is latency: 16 ms target, hard stop at twice that.
+    const target: f64 = 768;
+    const reserve: u32 = 768;
+    const out_cap: u32 = 1536;
+    // Captured audio that waits in front of the DSP is latency too, and the
+    // servo can only work it off at 1.5 % (15 ms per second). Whatever queues
+    // beyond 20 ms is stale: drop it instead of playing it late. Before this,
+    // the capture ring filled (341 ms) whenever no application had the
+    // microphone open, and the first seconds after opening it were that late.
+    const max_backlog: u32 = 960;
     while (app.alive.load(.acquire)) {
         const refill = nm_out_take_refill();
         if (refill > 0) {
@@ -158,22 +166,28 @@ fn worker(app: *App) void {
             // Keep the virtual mic fed with silence while the capture side is
             // absent (boot, replug, host not capturing). Otherwise the source
             // callback drains the reserve and every gap becomes an underrun.
+            _ = nm_in_drop(nm_in_level());
+            resample = asrc.Asrc{};
             var level = nm_out_level();
-            while (level < 1024) {
-                const n = @min(silence.len, 1024 - level);
+            while (level < reserve) {
+                const n = @min(silence.len, reserve - level);
                 _ = nm_out_write(&silence, @intCast(n));
                 level += n;
             }
             std.time.sleep(4 * std.time.ns_per_ms);
             continue;
         }
-        if (resample.space() >= 256) {
-            const want = @min(resample.space(), capture.len);
+        const backlog = nm_in_level();
+        if (backlog > max_backlog) _ = nm_in_drop(backlog - 256);
+        // Hold at most ~10 ms in the resampler; the rest waits in the capture
+        // ring, where the backlog check above can see and drop it.
+        if (resample.pending() < 512 and resample.space() >= 512) {
+            const want = @min(512, capture.len);
             const got = nm_in_read(capture[0..].ptr, @intCast(want));
             resample.write(capture[0..got]);
         }
         var produced: usize = 0;
-        while (resample.canRead(block) and nm_out_level() < 2048 and produced < 8) {
+        while (resample.canRead(block) and nm_out_level() < out_cap and produced < 8) {
             const level: f64 = @floatFromInt(nm_out_level());
             const err = (level - target) / target;
             resample.ratio = std.math.clamp(1.0 + 0.02 * err, 0.985, 1.015);
@@ -200,7 +214,7 @@ fn worker(app: *App) void {
 
 fn statusText(allocator: std.mem.Allocator, app: *App) ![]u8 {
     const mode: Mode = @enumFromInt(app.mode.load(.acquire));
-    return std.fmt.allocPrint(allocator, "engine={s}\ngain_db={d}\nmode={s}\nlisten={s}\nstreaming={d}\ndelay_samples={d}\nunderruns={d}\ngraph_max_request={d}\nunderrun_missing={d}\nout_fill={d}\nin_total={d}\nout_total={d}\nplayed_total={d}\nsource={s}\nshipped={s}\nprofile={s}\nthreads={d}\ncpu_budget={d:.2}\nsimd={s}\nnpu_invoked=no\n", .{
+    return std.fmt.allocPrint(allocator, "engine={s}\ngain_db={d}\nmode={s}\nlisten={s}\nstreaming={d}\ndelay_samples={d}\nunderruns={d}\ngraph_max_request={d}\nunderrun_missing={d}\nout_fill={d}\nin_fill={d}\nin_total={d}\nout_total={d}\nplayed_total={d}\nsource={s}\nshipped={s}\nprofile={s}\nthreads={d}\ncpu_budget={d:.2}\nsimd={s}\nnpu_invoked=no\n", .{
         app.slot.name,
         app.gain_db,
         @tagName(mode),
@@ -211,6 +225,7 @@ fn statusText(allocator: std.mem.Allocator, app: *App) ![]u8 {
         nm_max_request(),
         nm_missing(),
         nm_out_level(),
+        nm_in_level(),
         nm_in_total(),
         nm_out_total(),
         nm_played_total(),

@@ -60,6 +60,12 @@ pub const Asrc = struct {
         self.len += src.len;
     }
 
+    /// Input samples buffered but not consumed yet. They are latency.
+    pub fn pending(self: *const Asrc) usize {
+        const used: usize = @intFromFloat(@floor(self.pos));
+        return if (self.len > used) self.len - used else 0;
+    }
+
     pub fn canRead(self: *const Asrc, n: usize) bool {
         const need: usize = @intFromFloat(@floor(self.pos));
         return need >= 1 and self.len >= need + 3 and self.len >= need + n;

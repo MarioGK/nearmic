@@ -441,6 +441,19 @@ the NearMic source back into the Maono sink.
 
 ## 24/7 policy
 
+- **Realtime scheduling is required.** The Armbian kernel has
+  `CONFIG_RT_GROUP_SCHED`; with cgroup v2 it refuses `SCHED_FIFO` to every
+  process outside the root cgroup, so PipeWire and NearMic ran at normal
+  priority ("SCHED_FIFO 10 not granted (PERM)") and the 128-frame graph missed
+  about four cycles a second. Each miss is a 3-4 ms hole: the "robotic"
+  microphone. `rt_group_sched=0` in `extraargs` (`/boot/armbianEnv.txt`, set by
+  `apply-appliance.sh` and the image) fixes it. Check with
+  `ps -eLo cls,rtprio,comm | grep -E "data-loop|nearmic"`: the graph threads
+  must be `FF`. Measured on the operator's far-field recording through the
+  live path: DNSMOS OVRL 2.77 before, 3.11 after (offline reference 3.12).
+- CPU frequency: `rockpi4/config/cpufrequtils` -> `/etc/default/cpufrequtils`
+  (`performance`, 1416-1800 MHz, applied by Armbian to both clusters). The A53
+  cluster hosts PipeWire's graph thread and must not idle at 408 MHz.
 - `loginctl enable-linger mariogk` so user PipeWire, WirePlumber, NearMic and
   the link services start at boot without an SSH login.
 - `nearmic.service`: `Restart=always`, `RestartSec=2`, `Nice=-10`,
@@ -499,9 +512,10 @@ the NearMic source back into the Maono sink.
 - A Wi-Fi outage never restarts audio. The watchdog touches only `wlan0` and its
   adapter, and no NearMic, gadget or link unit depends on the network (none
   references `network-online.target`).
-- `nearmic-cpufreq.service` sets the A72 cluster (`policy4`) to `ondemand`, with
-  minimum 1416000 kHz and maximum 1800000 kHz. It is ordered after
-  `armbian-hardware-optimize`, which otherwise resets the cluster to 408-2016 MHz.
+- `nearmic-cpufreq.service` applies the same policy as
+  `/etc/default/cpufrequtils` at install time and at boot. Armbian's
+  `armbian-hardware-optimize` applies that file in the background after its
+  unit finishes, which is why the unit alone could not hold a policy.
 - `config/99-nearmic-sysctl.conf`: a kernel panic or oops reboots the board after
   10 s (`kernel.panic = 10`, `kernel.panic_on_oops = 1`).
 - Image only (`prepare-image.sh`): journald is persistent with a 200 MB cap
@@ -516,11 +530,18 @@ not for the lowest CPU. Measured on the board:
 
 | Stage | Setting | Latency |
 | --- | --- | --- |
-| RNNoise | 480-sample frame (algorithmic) | 10.0 ms |
-| NearMic output ring | servo target/cap 1024/2048 frames, settles at ~75 % | 16.0-21.3 ms |
+| DeepFilterNet3 | 480-sample hop, 2 hops of look-ahead | 30.0 ms |
+| Frame adapter | 480-sample engine frame in the 256-sample worker hop | 10.0 ms |
+| Look-ahead limiter | 256 samples | 5.3 ms |
+| NearMic output ring | servo target 768 frames, stop at 1536 | ~16 ms |
 | PipeWire graph | `clock.force-quantum = 128` frames | 2.7 ms |
-| UAC2 ALSA | 128-frame periods, 16 periods | 2.7 ms granularity |
-| **Board total** | | **~29-34 ms** |
+| **Through NearMic, measured** | click pairs, direct path vs bypass path | **66.7 ms** (72.0 ms before 2026-11-11) |
+
+The measurement (`/tmp/lat.sh` method: clicks sent to the computer directly
+and through NearMic in bypass mode, spacing read from the computer's
+recording) covers everything NearMic adds. RNNoise would be 20 ms less
+(no look-ahead) at lower quality. Captured audio that queues in front of the
+DSP beyond 20 ms is dropped instead of played late.
 
 - `nearmic-default-sink` sets `clock.force-quantum 128` on every start and
   `nearmic-health` restores it after a PipeWire restart.

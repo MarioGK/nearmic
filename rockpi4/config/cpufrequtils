@@ -1,0 +1,14 @@
+# NearMic appliance CPU frequency policy, read by Armbian's
+# armbian-hardware-optimization at boot (it applies the same three values to
+# both clusters, in the background, after its unit reports "finished" - which
+# is why a separate unit could not override it reliably).
+#
+# performance + 1416..1800 MHz:
+#   A53 cluster (PipeWire graph thread): held at its 1512 MHz maximum. Under
+#     ondemand it idled at 408 MHz and the 2.7 ms audio graph missed cycles.
+#   A72 pair (DeepFilterNet): held at 1800 MHz, the RK3399 specification, so
+#     every 10 ms frame costs the same; 2016 MHz measured no faster.
+ENABLE=false
+MIN_SPEED=1416000
+MAX_SPEED=1800000
+GOVERNOR=performance

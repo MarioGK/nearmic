@@ -16,6 +16,10 @@ pub const Adapter = struct {
     out_len: usize = 0,
     ctx: *anyopaque = undefined,
     process_frame: *const fn (*anyopaque, []const f32, []f32) void = undefined,
+    /// Optional: the engine's speech confidence (0..1) for the frame it just
+    /// processed. Read after every frame; `vad` is -1 for engines without one.
+    vad_fn: ?*const fn (*anyopaque) f32 = null,
+    vad: f32 = -1,
     started: bool = false,
 
     pub fn begin(self: *Adapter) void {
@@ -48,6 +52,7 @@ pub const Adapter = struct {
         while (self.in_len >= self.frame) {
             var frame_out: [1024]f32 = undefined;
             self.process_frame(self.ctx, self.in_buf[0..self.frame], frame_out[0..self.frame]);
+            if (self.vad_fn) |vad_fn| self.vad = vad_fn(self.ctx);
             std.debug.assert(self.out_len + self.frame <= self.out_buf.len);
             @memcpy(self.out_buf[self.out_len..][0..self.frame], frame_out[0..self.frame]);
             self.out_len += self.frame;

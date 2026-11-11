@@ -1,5 +1,5 @@
 [Unit]
-Description=NearMic CPU frequency policy (A72 pair floor and cap)
+Description=NearMic CPU frequency policy (A53 fixed, A72 floor and cap)
 Documentation=file:///usr/local/share/doc/nearmic/AUDIO.md
 # armbian-hardware-optimize resets both clusters to 408-2016 MHz from
 # /etc/default/cpufrequtils; run after it or this policy is silently undone
@@ -9,13 +9,10 @@ After=sysinit.target armbian-hardware-optimize.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# policy4 is the Cortex-A72 pair that runs DeepFilterNet.
-# - min 1416 MHz: ondemand otherwise parks the A72s at 408 MHz between frames
-#   and the next 10 ms frame starts slow, which shows up as deadline jitter.
-# - max 1800 MHz: the RK3399 A72 specification. DeepFilterNet3 measured
-#   5.4 ms per 10 ms frame at 1608 MHz, 5.2 ms at 1800 MHz and 5.1 ms at
-#   2016 MHz (2026-11-11), so the 2016 MHz OP1 overclock buys nothing.
-ExecStart=/bin/sh -c 'p=/sys/devices/system/cpu/cpufreq/policy4; echo ondemand > $p/scaling_governor; echo 1800000 > $p/scaling_max_freq; echo 1416000 > $p/scaling_min_freq'
+# Same policy as /etc/default/cpufrequtils (rockpi4/config/cpufrequtils), which
+# Armbian applies in the background at boot. This unit applies it immediately
+# on install and again at boot; see that file for the reasons.
+ExecStart=/bin/sh -c 'for p in /sys/devices/system/cpu/cpufreq/policy*; do echo performance > $p/scaling_governor; echo 1800000 > $p/scaling_max_freq; echo 1416000 > $p/scaling_min_freq; done'
 
 [Install]
 WantedBy=multi-user.target

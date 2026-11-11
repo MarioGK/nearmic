@@ -24,7 +24,11 @@ pub const catalog = [_]Spec{
     .{ .name = "dsp", .frame = dsp.hop, .algo_delay = dsp.hop },
     .{ .name = "dsp-dereverb", .frame = dsp.hop, .algo_delay = dsp.hop },
     .{ .name = "speex-dereverb", .frame = 480, .algo_delay = 480 },
-    .{ .name = "rnnoise", .frame = 480, .algo_delay = 0 },
+    // RNNoise and DeepFilterNet both use a 960-sample window with a 480-sample
+    // hop, so the overlap-add alone delays the output by 480 samples.
+    // DeepFilterNet3 adds two hops (960 samples) of model look-ahead.
+    .{ .name = "rnnoise", .frame = 480, .algo_delay = 480 },
+    .{ .name = "deepfilter", .frame = 480, .algo_delay = 1440 },
     .{ .name = "dpdfnet2", .frame = 480, .algo_delay = 2400 },
     .{ .name = "dpdfnet8", .frame = 480, .algo_delay = 2400 },
     .{ .name = "localvqe-v1.2", .frame = 768, .algo_delay = 814 },
@@ -55,6 +59,29 @@ const RnnoiseEng = opaque {};
 extern fn rnnoise_eng_new() ?*RnnoiseEng;
 extern fn rnnoise_eng_free(eng: ?*RnnoiseEng) void;
 extern fn rnnoise_eng_process(eng: *RnnoiseEng, in: [*]const f32, out: [*]f32) void;
+extern fn rnnoise_eng_vad(eng: *const RnnoiseEng) f32;
+
+const DfState = opaque {};
+extern fn df_create(path: ?[*:0]const u8, atten_lim: f32, log_level: ?[*:0]const u8) ?*DfState;
+extern fn df_free(st: ?*DfState) void;
+extern fn df_process_frame(st: *DfState, input: [*]f32, output: [*]f32) f32;
+extern fn df_get_frame_length(st: *DfState) usize;
+
+/// DeepFilterNet state plus the local SNR of the last frame, which the post
+/// chain uses as its speech detector.
+const DfEngine = struct {
+    st: *DfState,
+    lsnr: f32 = -15,
+};
+
+/// Map DeepFilterNet's local SNR (dB, about -15..35) to a speech confidence.
+/// Room tone and residual noise sit below 0 dB; speech, even far speech in a
+/// quiet room, is well above 5 dB.
+fn lsnrToSpeech(lsnr: f32) f32 {
+    return std.math.clamp((lsnr - df_lsnr_floor) / (df_lsnr_full - df_lsnr_floor), 0, 1);
+}
+pub const df_lsnr_floor: f32 = -5;
+pub const df_lsnr_full: f32 = 10;
 
 const DpdfEng = opaque {};
 extern fn dpdf_eng_cpu_ok() c_int;
@@ -104,6 +131,10 @@ pub fn availability(name: []const u8) Availability {
         if (!options.with_rnnoise) return .{ .ok = false, .reason = "not linked in this build" };
         return .{ .ok = true, .reason = "" };
     }
+    if (std.mem.eql(u8, spec.name, "deepfilter")) {
+        if (!options.with_deepfilter) return .{ .ok = false, .reason = "not linked in this build (scripts/build-deepfilter-aarch64.sh)" };
+        return .{ .ok = true, .reason = "" };
+    }
     if (std.mem.eql(u8, spec.name, "dpdfnet2") or std.mem.eql(u8, spec.name, "dpdfnet8")) {
         if (comptime !options.with_dpdfnet) return .{ .ok = false, .reason = "not linked in this build" };
         if (dpdf_eng_cpu_ok() == 0) return .{ .ok = false, .reason = "this CPU does not support AVX2 and FMA" };
@@ -138,6 +169,7 @@ const Kind = union(enum) {
     rock: *rock.Engine,
     speex: *SpeexEng,
     rnnoise: *RnnoiseEng,
+    deepfilter: *DfEngine,
     dpdf: *DpdfEng,
     localvqe: *localvqe_mod.Engine,
 };
@@ -159,7 +191,7 @@ pub const Slot = struct {
 
     pub fn process(self: *Slot, input: []const f32, output: []f32) void {
         self.adapter.pushHop(input, output);
-        if (self.post) |post| post.process(output);
+        if (self.post) |post| post.process(output, self.adapter.vad);
     }
 
     pub fn delaySamples(self: *const Slot) usize {
@@ -186,6 +218,10 @@ pub const Slot = struct {
             },
             .speex => |eng| if (comptime options.with_speex) speex_eng_free(eng),
             .rnnoise => |eng| if (comptime options.with_rnnoise) rnnoise_eng_free(eng),
+            .deepfilter => |eng| {
+                if (comptime options.with_deepfilter) df_free(eng.st);
+                self.allocator.destroy(eng);
+            },
             .dpdf => |eng| if (comptime options.with_dpdfnet) dpdf_eng_free(eng),
             .localvqe => |eng| {
                 eng.deinit();
@@ -221,6 +257,30 @@ fn processRnnoise(ctx: *anyopaque, input: []const f32, output: []f32) void {
     }
     const eng: *RnnoiseEng = @ptrCast(@alignCast(ctx));
     rnnoise_eng_process(eng, input.ptr, output.ptr);
+}
+
+fn processDeepfilter(ctx: *anyopaque, input: []const f32, output: []f32) void {
+    if (comptime !options.with_deepfilter) {
+        @memset(output, 0);
+        return;
+    }
+    const eng: *DfEngine = @ptrCast(@alignCast(ctx));
+    // libDF takes a mutable input pointer but does not write to it; copy so
+    // the adapter's buffer stays const.
+    var x: [480]f32 = undefined;
+    @memcpy(&x, input[0..480]);
+    eng.lsnr = df_process_frame(eng.st, &x, output.ptr);
+}
+
+fn vadDeepfilter(ctx: *anyopaque) f32 {
+    const eng: *DfEngine = @ptrCast(@alignCast(ctx));
+    return lsnrToSpeech(eng.lsnr);
+}
+
+fn vadRnnoise(ctx: *anyopaque) f32 {
+    if (comptime !options.with_rnnoise) return -1;
+    const eng: *RnnoiseEng = @ptrCast(@alignCast(ctx));
+    return rnnoise_eng_vad(eng);
 }
 
 fn processDpdf(ctx: *anyopaque, input: []const f32, output: []f32) void {
@@ -272,6 +332,30 @@ pub fn open(allocator: std.mem.Allocator, name: []const u8, opts: OpenOptions) !
         slot.kind = .{ .rnnoise = eng };
         slot.adapter.ctx = eng;
         slot.adapter.process_frame = processRnnoise;
+        slot.adapter.vad_fn = vadRnnoise;
+    } else if (std.mem.eql(u8, spec.name, "deepfilter")) {
+        if (comptime !options.with_deepfilter) return error.Unavailable;
+        // Full suppression (100 dB): the model's own mask decides what is
+        // speech. NEARMIC_DF_ATTEN_DB caps it, e.g. 30 keeps a trace of room.
+        const atten: f32 = if (std.posix.getenv("NEARMIC_DF_ATTEN_DB")) |v|
+            std.fmt.parseFloat(f32, v) catch 100
+        else
+            100;
+        // A null path loads the DeepFilterNet3 model embedded in libdf.a.
+        const st = df_create(null, atten, null) orelse return error.Unavailable;
+        if (df_get_frame_length(st) != spec.frame) {
+            df_free(st);
+            return error.Unavailable;
+        }
+        const eng = allocator.create(DfEngine) catch |err| {
+            df_free(st);
+            return err;
+        };
+        eng.* = .{ .st = st };
+        slot.kind = .{ .deepfilter = eng };
+        slot.adapter.ctx = eng;
+        slot.adapter.process_frame = processDeepfilter;
+        slot.adapter.vad_fn = vadDeepfilter;
     } else if (std.mem.eql(u8, spec.name, "dpdfnet2") or std.mem.eql(u8, spec.name, "dpdfnet8")) {
         if (comptime !options.with_dpdfnet) return error.Unavailable;
         const which: u8 = if (std.mem.eql(u8, spec.name, "dpdfnet2")) 2 else 8;
@@ -308,10 +392,11 @@ pub fn open(allocator: std.mem.Allocator, name: []const u8, opts: OpenOptions) !
         slot.adapter.process_frame = processChain;
     }
     switch (slot.kind) {
-        .rnnoise, .dpdf, .localvqe => {
+        .rnnoise, .deepfilter, .dpdf, .localvqe => {
             if (std.posix.getenv("NEARMIC_NO_POST") == null) {
                 const post = try allocator.create(voice.Post);
                 post.* = voice.Post.init(true);
+                post.trust_vad = slot.kind == .deepfilter;
                 slot.post = post;
             }
         },

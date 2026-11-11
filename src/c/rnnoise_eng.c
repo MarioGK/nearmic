@@ -4,6 +4,7 @@
 
 typedef struct RnnoiseEng {
     DenoiseState *st;
+    float vad;
 } RnnoiseEng;
 
 RnnoiseEng *rnnoise_eng_new(void) {
@@ -27,6 +28,11 @@ void rnnoise_eng_process(RnnoiseEng *eng, const float *in, float *out) {
     float x[480];
     int i;
     for (i = 0; i < 480; i++) x[i] = in[i] * 32768.0f;
-    rnnoise_process_frame(eng->st, x, x);
+    eng->vad = rnnoise_process_frame(eng->st, x, x);
     for (i = 0; i < 480; i++) out[i] = x[i] / 32768.0f;
+}
+
+/* Speech probability (0..1) of the last processed frame. */
+float rnnoise_eng_vad(const RnnoiseEng *eng) {
+    return eng->vad;
 }

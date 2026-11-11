@@ -15,13 +15,12 @@
 #define RING 16384
 #define RING_MASK (RING - 1)
 /* The ring is the queue between the DSP worker and the playback callback, so
-   whatever it holds is added latency on the microphone the host sees. Keep
-   ~21 ms of reserve. The graph runs at 128 frames and the UAC2 ALSA periods
-   are 128, so this is eight callbacks of slack: four and six were measurably
-   too tight under CFS on the RK3399. 64 ms (the original value) was long
-   enough to be audible as lag between talking and the host hearing it. */
-#define OUT_PREFILL 1024
-#define REFILL 1024
+   whatever it holds is added latency on the microphone the host sees. 16 ms
+   of reserve: the graph runs at 128 frames with realtime priority
+   (rt_group_sched=0), and a 480-sample engine delivers in 10 ms bursts, so
+   the level swings by about one burst around this value. */
+#define OUT_PREFILL 768
+#define REFILL 768
 
 struct Api {
     void (*pw_init)(int *, char ***);
@@ -426,6 +425,15 @@ uint32_t nm_max_request(void) { return atomic_load_explicit(&max_request, memory
 uint64_t nm_missing(void) { return atomic_load_explicit(&missing_total, memory_order_relaxed); }
 
 uint32_t nm_out_level(void) { return ring_count(&out_ring); }
+uint32_t nm_in_level(void) { return ring_count(&in_ring); }
+/* Discard up to n of the oldest captured samples (single consumer: the worker). */
+uint32_t nm_in_drop(uint32_t n) {
+    uint32_t have = ring_count(&in_ring);
+    if (n > have) n = have;
+    uint32_t r = atomic_load_explicit(&in_ring.r, memory_order_relaxed);
+    atomic_store_explicit(&in_ring.r, (r + n) & RING_MASK, memory_order_release);
+    return n;
+}
 
 uint64_t nm_in_total(void) { return atomic_load_explicit(&in_total, memory_order_relaxed); }
 uint64_t nm_out_total(void) { return atomic_load_explicit(&out_total, memory_order_relaxed); }

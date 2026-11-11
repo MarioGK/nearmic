@@ -244,7 +244,7 @@ ENV="$ROOT/boot/armbianEnv.txt"
 sudo install -d "$ROOT/boot/overlay-user"
 sudo install -m 0644 "$TREE/dtb/nearmic-otg.dtbo" "$ROOT/boot/overlay-user/nearmic-otg.dtbo"
 sudo grep -q '^user_overlays=' "$ENV" || echo 'user_overlays=nearmic-otg' | sudo tee -a "$ENV" >/dev/null
-sudo grep -q '^extraargs=' "$ENV" || echo 'extraargs=fsck.repair=yes panic=10' | sudo tee -a "$ENV" >/dev/null
+sudo grep -q '^extraargs=' "$ENV" || echo 'extraargs=fsck.repair=yes panic=10 rt_group_sched=0' | sudo tee -a "$ENV" >/dev/null
 sudo cp -a "$ENV" "$ENV.nearmic.bak"
 
 echo "== NearMic"
