@@ -168,3 +168,47 @@ own far-field speech recorded from the Maono (speech about -30 dBFS, room
 - What still limits "sounds close": the room reverberation in the far-field
   input. SIG stays near 3.4 for every setting tried.
 
+## 2026-11-11 (evening): making the far microphone sound closer
+
+Microphone: Comica VM40 on the Maono, more than arm's length away. Same 45 s
+far-field recording. Three predictors, because none of them is the ear:
+DNSMOS P.835 (16 kHz), SIGMOS (`scripts/score-sigmos.py`, 48 kHz, has separate
+REVERB/COL/DISC scores) and SRMR (speech-to-reverberation modulation ratio,
+higher = drier).
+
+| Step | SIGMOS OVRL | SIGMOS REVERB | SIGMOS DISC | SRMR | DNSMOS OVRL |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| raw microphone | 1.98 | 3.63 | 3.25 | 3.47 | 1.84 |
+| live path the operator called robotic | 2.45 | 3.67 | 3.36 | 3.92 | 2.77 |
+| after realtime fix, old post chain (offline) | 2.70 | 3.78 | 3.68 | 4.85 | 3.12 |
+| new post chain (offline) | 2.70 | 3.88 | 3.77 | 5.50 | 3.08 |
+| new post chain, live path | 2.60 | 3.66 | 3.90 | 5.36 | 3.03 |
+
+What was tried, and what it measured:
+
+- **WPE dereverberation** (nara_wpe, offline 3-iteration best case, 1024/256
+  and 512/128 STFT, 20-30 taps) in front of DeepFilterNet: SRMR 4.85 -> 4.92,
+  DNSMOS 3.12 -> 3.12. No measurable gain, so it was not ported.
+- **DPDFNet2 48 kHz HR** (sherpa-onnx, the heavier model): SIGMOS OVRL 2.52
+  against 2.63 for DeepFilterNet3 at equal loudness, SRMR 4.76 against 5.53.
+  Not better on this voice, and too heavy for the board anyway.
+- **The syllabic leveler was adding room.** It lifted everything under
+  -24 dBFS with a 60 ms detector, so the quiet tail of each word came up:
+  SIGMOS REVERB 4.16 without the post chain, 3.79 with it. It is replaced by
+  a speech-gated gain rider (2 s, ignores blocks more than 15 dB under the
+  speech level, holds in pauses): SRMR 4.88 -> 5.39, REVERB 3.79 -> 3.93 with
+  the other scores unchanged. `NEARMIC_LVL_SLOW_S=0` restores the old one.
+- **EQ.** Against the Byrne et al. (1994) long-term spectrum of close speech
+  the processed voice was 6-10 dB short at 125-250 Hz, 5-8 dB hot at 1-2 kHz
+  and short above 6 kHz; the old EQ pushed the other way (+4 dB at 3.2 kHz,
+  -2 dB below 300 Hz). A full correction scored lower; the default is now a
+  partial one, `hp:80,ls:230:4,pk:1300:0.9:-3,hs:6500:3` (`NEARMIC_EQ`).
+- **Gate** -20 -> -12 dB: same overall, better loudness and discontinuity.
+- Shorter gate hold (120-150 ms, to cut word tails) lowered every score.
+
+Where it stands: the overall predictors plateau near 2.7 (SIGMOS) / 3.1
+(DNSMOS) for every model and setting tried. What is left is the acoustic
+distance itself. The effective levers are physical: the microphone closer or
+aimed at the mouth (each halving of distance is +6 dB of direct sound over the
+room), and absorption near the talker.
+

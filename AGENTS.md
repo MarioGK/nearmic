@@ -333,9 +333,9 @@ cpu_budget = 0.80
   `nearmic-firstboot.service`, times a 10 s clip on cores 4-5, and keeps
   DeepFilterNet only if its realtime factor is 0.60 or less. Otherwise it sets
   `engine = "rnnoise"` and `gain_db = 10`. RNNoise is the fallback: about 20 ms
-  less delay, more residual noise, and robotic on far speech. `voice.Post` adds a 90 Hz high-pass, -2 dB low
-  shelf, +4 dB presence peak, +2 dB air shelf, a presence-gated speech
-  leveler and a 5.3 ms look-ahead limiter. The legacy
+  less delay, more residual noise, and robotic on far speech. `voice.Post` adds an EQ fitted to the far microphone
+  (`hp:80,ls:230:4,pk:1300:0.9:-3,hs:6500:3`), a speech-gated gain rider,
+  a -12 dB speech gate and a 5.3 ms look-ahead limiter. The legacy
   `dsp`/`dsp-dereverb` engines remain selectable but are not the default. See
   [rockpi4/QUALITY.md](rockpi4/QUALITY.md).
 - This board runs `engine = "deepfilter"`, `gain_db = 0` (since 2026-11-11).

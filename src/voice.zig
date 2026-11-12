@@ -16,7 +16,7 @@ const dsp = @import("dsp.zig");
 /// - a speech leveler holds close speech at a fixed level and lifts quiet
 ///   (far) speech by up to +12 dB, gated on speech presence so the noise
 ///   RNNoise removed is not lifted with it
-/// - a speech gate: between phrases the output fades by 20 dB, so the
+/// - a speech gate: between phrases the output fades by 12 dB, so the
 ///   residual noise the leveler and makeup gain would lift stays out of the
 ///   way without the hard on/off of a deep gate. It is keyed on the engine's own speech detector
 ///   (RNNoise VAD, DeepFilterNet local SNR), which leads the audio by the
@@ -25,10 +25,8 @@ const dsp = @import("dsp.zig");
 ///   so the level can be loud without clipping or the flat-topped "popping"
 ///   sound of a limiter that reacts after the peak
 pub const Post = struct {
-    highpass: dsp.Biquad,
-    low: dsp.Biquad,
-    presence: dsp.Biquad,
-    air: dsp.Biquad,
+    eq: [max_eq]dsp.Biquad = undefined,
+    eq_len: usize = 0,
     leveler: Leveler,
     gate: Gate,
     limiter: LookaheadLimiter,
@@ -45,24 +43,76 @@ pub const Post = struct {
 
     pub fn init(level: bool) Post {
         var post = Post{
-            .highpass = dsp.Biquad.highpass(dsp.sample_rate, 90, 0.707),
-            .low = dsp.Biquad.lowShelf(dsp.sample_rate, 300, -2.0),
-            .presence = dsp.Biquad.peaking(dsp.sample_rate, 3200, 1.0, 4.0),
-            .air = dsp.Biquad.highShelf(dsp.sample_rate, 8000, 2.0),
             .leveler = Leveler.init(),
             .gate = Gate.init(),
             .limiter = .{ .ceiling = dsp.dbToLin(-2.0) },
             .level = level,
             .gate_on = std.posix.getenv("NEARMIC_NO_GATE") == null,
         };
+        post.setEq(std.posix.getenv("NEARMIC_EQ") orelse default_eq);
+        if (envDb("NEARMIC_GATE_HOLD_MS")) |v| post.gate.hold_s = v / 1000.0;
+        if (envDb("NEARMIC_GATE_RELEASE_MS")) |v| post.gate.release_s = v / 1000.0;
         // Listening-test overrides (dB): gate depth, leveler trim and lift.
         if (envDb("NEARMIC_GATE_DB")) |v| {
             post.gate.closed_db = v;
             post.gate.gain_db = v;
         }
         if (envDb("NEARMIC_TRIM_DB")) |v| post.leveler.trim = dsp.dbToLin(v);
-        if (envDb("NEARMIC_LIFT_DB")) |v| post.leveler.max_lift_db = v;
+        if (envDb("NEARMIC_LIFT_DB")) |v| {
+            post.leveler.max_lift_db = v;
+            post.leveler.rider_lift_db = v;
+        }
+        if (envDb("NEARMIC_LVL_SLOW_S")) |v| post.leveler.slow_s = v;
+        if (envDb("NEARMIC_LVL_TARGET_DB")) |v| post.leveler.target_db = v;
         return post;
+    }
+
+    pub const max_eq = 8;
+
+    /// Equaliser, as "kind:freq[:q]:gain" items: hp:FREQ, ls:FREQ:GAIN_DB,
+    /// hs:FREQ:GAIN_DB, pk:FREQ:Q:GAIN_DB. NEARMIC_EQ replaces it.
+    ///
+    /// The default is fitted to the operator's far microphone (Comica VM40 on
+    /// a Maono interface, about arm's length and more): after DeepFilterNet
+    /// its long-term spectrum, against the Byrne et al. (1994) spectrum of
+    /// normal close speech, is 6-10 dB short at 125-250 Hz (no proximity
+    /// effect: thin, "far"), 5-8 dB hot at 1-2 kHz (boxy, nasal) and 5-12 dB
+    /// short above 6 kHz (no air). The curve corrects under half of each
+    /// deviation: the full correction ("hp:75,ls:230:6,pk:1300:0.9:-5,
+    /// pk:2100:1.4:-2,hs:6500:4") scored lower on SIGMOS and DNSMOS, this one
+    /// scores the same as flat and moves the spectrum the right way.
+    pub const default_eq = "hp:80,ls:230:4,pk:1300:0.9:-3,hs:6500:3";
+
+    pub fn setEq(self: *Post, spec: []const u8) void {
+        self.eq_len = 0;
+        var items = std.mem.tokenizeScalar(u8, spec, ',');
+        while (items.next()) |item| {
+            if (self.eq_len == max_eq) break;
+            var f: [4][]const u8 = undefined;
+            var n: usize = 0;
+            var parts = std.mem.splitScalar(u8, item, ':');
+            while (parts.next()) |part| {
+                if (n == f.len) break;
+                f[n] = part;
+                n += 1;
+            }
+            if (n < 2) continue;
+            const freq = std.fmt.parseFloat(f32, f[1]) catch continue;
+            const a = if (n > 2) std.fmt.parseFloat(f32, f[2]) catch continue else 0;
+            const b = if (n > 3) std.fmt.parseFloat(f32, f[3]) catch continue else 0;
+            const bq: dsp.Biquad = if (std.mem.eql(u8, f[0], "hp"))
+                dsp.Biquad.highpass(dsp.sample_rate, freq, 0.707)
+            else if (std.mem.eql(u8, f[0], "ls") and n >= 3)
+                dsp.Biquad.lowShelf(dsp.sample_rate, freq, a)
+            else if (std.mem.eql(u8, f[0], "hs") and n >= 3)
+                dsp.Biquad.highShelf(dsp.sample_rate, freq, a)
+            else if (std.mem.eql(u8, f[0], "pk") and n >= 4)
+                dsp.Biquad.peaking(dsp.sample_rate, freq, a, b)
+            else
+                continue;
+            self.eq[self.eq_len] = bq;
+            self.eq_len += 1;
+        }
     }
 
     /// Samples of added latency from the look-ahead limiter.
@@ -71,12 +121,8 @@ pub const Post = struct {
     /// `speech` is the engine's speech confidence (0..1) for the newest frame,
     /// or a negative value when the engine has no detector.
     pub fn process(self: *Post, samples: []f32, speech: f32) void {
-        for (samples) |*s| {
-            var x = self.highpass.process(s.*);
-            x = self.low.process(x);
-            x = self.presence.process(x);
-            x = self.air.process(x);
-            s.* = x;
+        for (self.eq[0..self.eq_len]) |*bq| {
+            for (samples) |*s| s.* = bq.process(s.*);
         }
         if (self.level) self.leveler.process(samples);
         // RNNoise's VAD reads most room noise as speech (mean 0.94 on noisy
@@ -114,6 +160,17 @@ pub const Leveler = struct {
     floor: f32 = 0,
     gain: f32 = 1,
     presence: f32 = 0,
+    /// Gain rider: when `slow_s` > 0 the gain follows the speech level over
+    /// seconds instead of syllables. A syllabic leveler lifts the quiet tail
+    /// of every word, and on a far microphone that tail is the room: SIGMOS
+    /// REVERB on the operator's recording is 4.16 without it and 3.79 with it.
+    /// The rider measures only while speech is present, holds its gain in
+    /// pauses, and leaves the dynamics inside a phrase alone. 0 = syllabic.
+    slow_s: f32 = 2.0,
+    slow: f32 = 0,
+    target_db: f32 = -24,
+    max_cut_db: f32 = 12,
+    rider_lift_db: f32 = 18,
 
     /// -80 dBFS (mean square). Neural engines output exact zeros in silence;
     /// without a lower bound the floor collapses to zero, re-seeds on the next
@@ -159,6 +216,39 @@ pub const Leveler = struct {
         }
 
         self.presence = presence;
+        if (self.slow_s > 0) {
+            // Speech-gated long-term level. Seed from the first speech block.
+            if (presence >= 0.5 and ms > min_floor) {
+                if (self.slow <= 0) {
+                    self.slow = ms;
+                } else if (ms > self.slow) {
+                    // A louder phrase is caught within a word or two.
+                    self.slow += coeff(self.slow_s * 0.5, samples.len) * (ms - self.slow);
+                } else if (ms > self.slow * 0.03) {
+                    // Softer speech pulls the level down four times slower,
+                    // and anything more than 15 dB under it is a word ending
+                    // or the room, not the talker: following those is what
+                    // lifts reverberation.
+                    self.slow += coeff(self.slow_s * 4.0, samples.len) * (ms - self.slow);
+                }
+            }
+            var desired_slow: f32 = self.trim;
+            if (self.slow > 0) {
+                const level_db = 10 * std.math.log10(self.slow);
+                const gain_db = std.math.clamp(self.target_db - level_db, -self.max_cut_db, self.rider_lift_db);
+                desired_slow = dsp.dbToLin(gain_db) * self.trim;
+            }
+            const r = if (desired_slow < self.gain) coeff(0.050, samples.len) else coeff(0.500, samples.len);
+            const g0 = self.gain;
+            self.gain += r * (desired_slow - self.gain);
+            const g1 = self.gain;
+            const count = @as(f32, @floatFromInt(samples.len));
+            for (samples, 0..) |*sample, i| {
+                const t = @as(f32, @floatFromInt(i + 1)) / count;
+                sample.* *= g0 + (g1 - g0) * t;
+            }
+            return;
+        }
         const level = @sqrt(self.envelope);
         var desired: f32 = self.trim;
         if (level > 1e-9) {
@@ -199,12 +289,13 @@ pub const Gate = struct {
     keep_at: f32 = 0.35,
     hold_s: f32 = 0.30,
     release_s: f32 = 0.15,
-    // -20 dB, not a hard mute: with the model already removing the noise, a
-    // deeper gate only adds audible on/off "dead air" between words. On the
-    // operator's far-field recording DNSMOS is the same at -20 and -45.
-    closed_db: f32 = -20,
+    // -12 dB, not a mute: with the model already removing the noise, a deep
+    // gate only adds audible on/off "dead air" between words. On the
+    // operator's far-field recording -12 scored as well as -20 and -45 overall
+    // and better on SIGMOS loudness and discontinuity.
+    closed_db: f32 = -12,
     hold_left: f32 = 0,
-    gain_db: f32 = -20,
+    gain_db: f32 = -12,
 
     pub fn init() Gate {
         return .{};
@@ -304,8 +395,36 @@ pub const LookaheadLimiter = struct {
     }
 };
 
+test "gain rider brings far speech to the target and holds its gain in pauses" {
+    var lv = Leveler.init();
+    var hop: [dsp.hop]f32 = undefined;
+    var n: usize = 0;
+    // Quiet room, then far speech at about -37 dBFS RMS for 6 s.
+    while (n < 200) : (n += 1) {
+        for (&hop, 0..) |*s, i| s.* = 0.0003 * @sin(@as(f32, @floatFromInt(i)) * 0.1);
+        lv.process(&hop);
+    }
+    n = 0;
+    while (n < 1100) : (n += 1) {
+        for (&hop, 0..) |*s, i| s.* = 0.02 * @sin(@as(f32, @floatFromInt(i)) * 0.1);
+        lv.process(&hop);
+    }
+    // -37 dBFS in, -24 dBFS target: +13 dB, times the trim.
+    const want = dsp.dbToLin(lv.target_db - 20.0 * std.math.log10(0.02 / @sqrt(2.0))) * lv.trim;
+    try std.testing.expectApproxEqRel(want, lv.gain, 0.08);
+    // A pause must not move the gain (no pumping, no lifted room tone).
+    const held = lv.gain;
+    n = 0;
+    while (n < 400) : (n += 1) {
+        for (&hop, 0..) |*s, i| s.* = 0.0003 * @sin(@as(f32, @floatFromInt(i)) * 0.1);
+        lv.process(&hop);
+    }
+    try std.testing.expectApproxEqRel(held, lv.gain, 0.02);
+}
+
 test "leveler compresses loud speech and ramps smoothly" {
     var lv = Leveler.init();
+    lv.slow_s = 0; // syllabic mode
     var hop: [dsp.hop]f32 = undefined;
 
     // Quiet room first, so the noise floor is established.
@@ -329,6 +448,7 @@ test "leveler compresses loud speech and ramps smoothly" {
 
 test "leveler lifts far speech by at most 12 dB over the noise floor" {
     var lv = Leveler.init();
+    lv.slow_s = 0; // syllabic mode
     var hop: [dsp.hop]f32 = undefined;
 
     var n: usize = 0;
