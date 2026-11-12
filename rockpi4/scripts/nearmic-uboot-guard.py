@@ -10,12 +10,32 @@ update (armbian-install, a forced u-boot update) ever restores the stock order.
 
 It only ever rewrites that one 47-byte string, and only when it finds exactly
 one stock copy in the boot area. Runs at boot and after every dpkg run.
+
+Second patch, same mechanism: U-Boot must not power the USB host ports.
+Its device tree marks `vcc5v0_host` (GPIO4_D1, the 5 V switch for the USB-A
+host ports) as an always-on fixed regulator, so U-Boot turns the ports on about
+a second after power is applied. With the Maono and the Wi-Fi adapter plugged
+in, every start from power-off then hung before Linux (green LED, no blue),
+while starts with nothing plugged in, restarts with power already on, and
+hot-plugging the same devices later all worked (2026-11-10..12). Released, the
+enable line reads low and the ports are unpowered (measured on the running
+board), so renaming the node's `compatible` from "regulator-fixed" to an
+unmatched string of the same length leaves the ports off through the
+bootloader. Linux switches them on a few seconds later from its own device
+tree, once the supply has settled.
+
+    nearmic-uboot-guard                 # the running board: eMMC boot area + package file
+    nearmic-uboot-guard FILE[:LIMIT]... # image builder: patch these files instead
 """
 import glob
 import os
 import sys
 
 OLD = b"boot_targets=usb0 mmc1 mmc0 nvme0 pxe dhcp sf0 "
+VBUS_NODE = b"\x00\x00\x00\x01vcc5v0-host-regulator\x00"
+VBUS_OLD = b"regulator-fixed\x00"
+VBUS_NEW = b"regulator-nmoff\x00"
+
 NEW = b"boot_targets=mmc1 mmc0 nvme0 usb0 pxe dhcp sf0 "
 BOOT_AREA = 32768 * 512  # everything before the first partition
 
@@ -34,18 +54,34 @@ def patch(path, limit=0):
             if not chunk:
                 break
             data += chunk
+        rc = 0
+        # USB host power: the first "compatible" value after the node header.
+        nodes = [i for i in range(len(data)) if data.startswith(VBUS_NODE, i)] if VBUS_NODE in data else []
+        for at in nodes:
+            win = data[at : at + 256]
+            if VBUS_NEW in win:
+                print(f"nearmic-uboot-guard: {path}: USB host power left to Linux")
+            elif VBUS_OLD in win:
+                os.pwrite(fd, VBUS_NEW, at + win.index(VBUS_OLD))
+                os.fsync(fd)
+                print(f"nearmic-uboot-guard: {path}: U-Boot no longer powers the USB host ports (byte {at + win.index(VBUS_OLD)})")
+            else:
+                print(f"nearmic-uboot-guard: {path}: vcc5v0_host node found but not a fixed regulator; not touching it")
+                rc = 1
+        if not nodes:
+            print(f"nearmic-uboot-guard: {path}: no vcc5v0-host-regulator node found")
         stock, fixed = data.count(OLD), data.count(NEW)
         if stock == 0:
             state = "eMMC-first" if fixed else "no boot_targets string found"
             print(f"nearmic-uboot-guard: {path}: {state}")
-            return 0
+            return rc
         if stock != 1:
             print(f"nearmic-uboot-guard: {path}: {stock} stock copies, not touching it")
             return 1
         os.pwrite(fd, NEW, data.index(OLD))
         os.fsync(fd)
         print(f"nearmic-uboot-guard: {path}: restored eMMC-first boot order at byte {data.index(OLD)}")
-        return 0
+        return rc
     finally:
         os.close(fd)
 
@@ -64,6 +100,11 @@ def root_disk():
 
 def main():
     rc = 0
+    if len(sys.argv) > 1:
+        for arg in sys.argv[1:]:
+            path, _, limit = arg.partition(":")
+            rc |= patch(path, int(limit) if limit else 0)
+        return rc
     disk = root_disk()
     if disk:
         rc |= patch(disk, BOOT_AREA)

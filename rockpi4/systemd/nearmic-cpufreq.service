@@ -1,5 +1,5 @@
 [Unit]
-Description=NearMic CPU frequency policy (A53 fixed, A72 floor and cap)
+Description=NearMic CPU frequency policy (performance, A53 1512 MHz, A72 1800 MHz)
 Documentation=file:///usr/local/share/doc/nearmic/AUDIO.md
 # armbian-hardware-optimize resets both clusters to 408-2016 MHz from
 # /etc/default/cpufrequtils; run after it or this policy is silently undone

@@ -1,13 +1,21 @@
 # NearMic appliance CPU frequency policy, read by Armbian's
 # armbian-hardware-optimization at boot (it applies the same three values to
-# both clusters, in the background, after its unit reports "finished" - which
-# is why a separate unit could not override it reliably).
+# both clusters, in the background, after its unit reports "finished").
 #
-# performance + 1416..1800 MHz:
-#   A53 cluster (PipeWire graph thread): held at its 1512 MHz maximum. Under
-#     ondemand it idled at 408 MHz and the 2.7 ms audio graph missed cycles.
-#   A72 pair (DeepFilterNet): held at 1800 MHz, the RK3399 specification, so
-#     every 10 ms frame costs the same; 2016 MHz measured no faster.
+# performance, 1416..1800 MHz: the operator's choice (2026-11-12), maximum
+# performance. A53 cluster held at 1512 MHz (PipeWire's 2.7 ms graph thread),
+# A72 pair held at 1800 MHz, the RK3399 specification (DeepFilterNet3).
+#
+# Known risk, recorded so the next person does not have to rediscover it: both
+# times the clusters were pinned the board later died without a log line
+# (2026-11-09 seconds after 2016 MHz; 2026-11-12 after 17 h and after 1.5 h at
+# 1512/1800 MHz, with the Maono and the Wi-Fi adapter powered from the board).
+# The USB devices now sit on a powered hub, which removes their load from the
+# board's 5 V rail. If silent deaths return, switch to
+#   GOVERNOR=ondemand MIN_SPEED=1008000 MAX_SPEED=1608000
+# which costs DeepFilterNet3 0.2 ms per 10 ms frame.
+# 2016 MHz (the OP1 overclock) is deliberately not used: it measured 0.1 ms
+# faster per frame than 1800 MHz.
 ENABLE=false
 MIN_SPEED=1416000
 MAX_SPEED=1800000

@@ -217,6 +217,9 @@ fi
 for f in "$ROOT"/usr/lib/linux-u-boot-*/u-boot.itb; do
 	[ -f "$f" ] && sudo bash -c "$(declare -f patch_uboot); patch_uboot '$f'"
 done
+# Second bootloader patch (see nearmic-uboot-guard.py): U-Boot leaves the USB
+# host ports unpowered, so a start from power-off works with devices attached.
+sudo python3 -I "$TREE/scripts/nearmic-uboot-guard.py" "$LOOP:$((32768 * 512))" "$ROOT"/usr/lib/linux-u-boot-*/u-boot.itb
 
 # First boot stage: Rockchip's DDR init blob instead of U-Boot's open-source
 # TPL. With Armbian's stock idbloader (U-Boot TPL) this board hung before Linux
