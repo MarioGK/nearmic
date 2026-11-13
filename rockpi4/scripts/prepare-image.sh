@@ -217,8 +217,8 @@ fi
 for f in "$ROOT"/usr/lib/linux-u-boot-*/u-boot.itb; do
 	[ -f "$f" ] && sudo bash -c "$(declare -f patch_uboot); patch_uboot '$f'"
 done
-# Second bootloader patch (see nearmic-uboot-guard.py): U-Boot leaves the USB
-# host ports unpowered, so a start from power-off works with devices attached.
+# Bootloader guard on the image (boot order; the USB-power patch inside it is
+# opt-in and stays off, see nearmic-uboot-guard.py).
 sudo python3 -I "$TREE/scripts/nearmic-uboot-guard.py" "$LOOP:$((32768 * 512))" "$ROOT"/usr/lib/linux-u-boot-*/u-boot.itb
 
 # First boot stage: Rockchip's DDR init blob instead of U-Boot's open-source
