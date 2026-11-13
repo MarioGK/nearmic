@@ -204,6 +204,8 @@ fi
 do_install "$SRC/scripts/setup-uac2-gadget.sh" /usr/local/sbin/nearmic-gadget-setup 0755 root:root
 do_install "$SRC/scripts/nearmic-wifi-watchdog.sh" /usr/local/sbin/nearmic-wifi-watchdog 0755 root:root
 do_install "$SRC/scripts/nearmic-uboot-guard.py" /usr/local/sbin/nearmic-uboot-guard 0755 root:root
+do_install "$SRC/scripts/nearmic-udc-watch.py" /usr/local/sbin/nearmic-udc-watch 0755 root:root
+do_install "$SRC/systemd/nearmic-udc-watch.service" /etc/systemd/system/nearmic-udc-watch.service 0644 root:root
 do_install "$SRC/systemd/nearmic-uboot-guard.service" /etc/systemd/system/nearmic-uboot-guard.service 0644 root:root
 do_install "$SRC/apt/99nearmic-uboot-guard" /etc/apt/apt.conf.d/99nearmic-uboot-guard 0644 root:root
 do_install "$SRC/scripts/nearmic-link.sh" "$BOARD_HOME/.local/bin/nearmic-link" 0755 "$BOARD_USER:$BOARD_GID"
@@ -256,6 +258,8 @@ do_install "$SRC/config/cpufrequtils" /etc/default/cpufrequtils 0644 root:root
 do_install "$SRC/network/10-nearmic-usb-wifi.link" /etc/systemd/network/10-nearmic-usb-wifi.link 0644 root:root
 do_install "$SRC/network/30-nearmic-usb0.network" /etc/systemd/network/30-nearmic-usb0.network 0644 root:root
 do_install "$SRC/udev/70-nearmic-wifi.rules" /etc/udev/rules.d/70-nearmic-wifi.rules 0644 root:root
+do_install "$SRC/systemd/wlan0-device.d/10-nearmic-timeout.conf" \
+	"/etc/systemd/system/sys-subsystem-net-devices-wlan0.device.d/10-nearmic-timeout.conf" 0644 root:root
 do_install "$SRC/systemd/user@.service.d/99-nearmic-limits.conf" \
 	"/etc/systemd/system/user@.service.d/99-nearmic-limits.conf" 0644 root:root
 
@@ -275,6 +279,8 @@ run systemctl enable nearmic-cpufreq.service || warn "could not enable nearmic-c
 run systemctl restart nearmic-cpufreq.service || warn "could not start nearmic-cpufreq.service"
 run systemctl enable --now nearmic-wifi-watchdog.timer || warn "could not start nearmic-wifi-watchdog.timer"
 run systemctl enable nearmic-uboot-guard.service || warn "could not enable nearmic-uboot-guard.service"
+run systemctl enable nearmic-udc-watch.service || warn "could not enable nearmic-udc-watch.service"
+run systemctl restart nearmic-udc-watch.service || warn "could not start nearmic-udc-watch.service"
 run /usr/local/sbin/nearmic-uboot-guard || warn "U-Boot boot-order guard reported a problem"
 run systemctl enable nearmic-dash.service || warn "could not enable nearmic-dash.service"
 run systemctl restart nearmic-dash.service || warn "could not start nearmic-dash.service"

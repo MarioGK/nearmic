@@ -5,8 +5,8 @@
 # the DSP; it only repairs the plumbing that a USB replug, a USB re-enumeration
 # or a PipeWire restart can break:
 #
-#   - the UAC2 gadget system service and its UDC, including a USB link that
-#     did not re-enumerate after the computer woke up
+#   - the UAC2 gadget system service and its UDC (a link the computer
+#     re-attached is rebuilt by nearmic-udc-watch, not here)
 #   - the three user units (nearmic, both link supervisors)
 #   - the NearMic source actually streaming (an active unit can be stalled)
 #   - the UAC2 gadget as the WirePlumber default sink
@@ -30,29 +30,20 @@ log() { echo "nearmic-health: $*"; }
 # only fix, and the operator has to schedule it.
 [ -e "/sys/class/udc/$GADGET" ] || exit 0
 
-# 0. The USB link to the computer. After the computer suspends and resumes,
-#    dwc3 can stay in "default"/"addressed": bus reset seen, never enumerated,
-#    so the computer has no NearMic device until something re-attaches it
-#    (seen 2026-11-11: gone from 15:49 until a manual re-attach at 18:04).
-#    If the link is in such a half-open state on two checks in a row, pulse
-#    the pull-up. "configured" is healthy; "suspended"/"not attached" mean the
-#    computer is asleep or unplugged and need nothing.
-UDC_STATE="$(cat "/sys/class/udc/$GADGET/state" 2>/dev/null || true)"
-UDC_FLAG="$XDG_RUNTIME_DIR/nearmic-udc-halfopen"
-case "$UDC_STATE" in
-default | addressed | powered | attached)
-	if [ -e "$UDC_FLAG" ]; then
-		log "USB link stuck in '$UDC_STATE'; re-attaching to the computer"
-		echo disconnect | sudo -n tee "/sys/class/udc/$GADGET/soft_connect" >/dev/null 2>&1
-		sleep 1
-		echo connect | sudo -n tee "/sys/class/udc/$GADGET/soft_connect" >/dev/null 2>&1
-		rm -f "$UDC_FLAG"
-	else
-		: >"$UDC_FLAG"
-	fi
-	;;
-*) rm -f "$UDC_FLAG" ;;
-esac
+# 0. PipeWire's own graph thread must be realtime. The daemon's module-rt does
+#    not get there by itself on this image (it falls back to RTKit, and with
+#    RTKit installed it still supervised 0 threads), so its data-loop ran at
+#    normal priority: 13-108 missed graph cycles per 20 s with the Maono behind
+#    a hub, 0 with the thread at SCHED_FIFO 83 (2026-11-12). NearMic's own
+#    threads get FIFO through their unit limits; this covers the daemon.
+#    Needs rt_group_sched=0 (see apply-appliance.sh).
+for pid in $(pgrep -x pipewire 2>/dev/null); do
+	for tid in $(ps -L -o tid=,cls=,comm= -p "$pid" 2>/dev/null | awk '$3 ~ /^data-loop/ && $2 != "FF" {print $1}'); do
+		if sudo -n chrt -f -p 83 "$tid" >/dev/null 2>&1; then
+			log "PipeWire graph thread $tid set to SCHED_FIFO 83"
+		fi
+	done
+done
 
 # 1. System gadget unit. It is a oneshot with RemainAfterExit=yes, so it stays
 #    "active" unless it failed; a failed start after re-enumeration is the case

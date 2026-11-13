@@ -1,0 +1,16 @@
+[Unit]
+Description=NearMic: rebind the USB gadget when the computer re-attaches the link
+Documentation=file:///usr/local/share/doc/nearmic/AUDIO.md
+After=nearmic-gadget.service
+Wants=nearmic-gadget.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/nearmic-udc-watch
+Restart=always
+RestartSec=5
+CPUAffinity=0-3
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

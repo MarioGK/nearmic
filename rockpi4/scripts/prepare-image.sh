@@ -183,6 +183,8 @@ sudo rm -f "$ROOT/root/.not_logged_in_yet"
 echo "== network (Wi-Fi $WIFI_SSID, country $WIFI_COUNTRY)"
 sudo install -m 0644 "$TREE/network/10-nearmic-usb-wifi.link" "$ROOT/etc/systemd/network/10-nearmic-usb-wifi.link"
 sudo install -m 0644 "$TREE/udev/70-nearmic-wifi.rules" "$ROOT/etc/udev/rules.d/70-nearmic-wifi.rules"
+sudo install -D -m 0644 "$TREE/systemd/wlan0-device.d/10-nearmic-timeout.conf" \
+	"$ROOT/etc/systemd/system/sys-subsystem-net-devices-wlan0.device.d/10-nearmic-timeout.conf"
 printf 'options cfg80211 ieee80211_regdom=%s\n' "$WIFI_COUNTRY" | sudo tee "$ROOT/etc/modprobe.d/nearmic-wifi.conf" >/dev/null
 esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 sudo install -m 0600 /dev/null "$ROOT/etc/netplan/20-nearmic-wifi.yaml"

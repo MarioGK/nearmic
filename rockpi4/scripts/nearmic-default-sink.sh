@@ -32,4 +32,12 @@ while [ "$i" -lt 30 ]; do
 	i=$((i + 1))
 	sleep 1
 done
+
+# PipeWire's graph thread at realtime priority before NearMic starts feeding
+# it (nearmic-health repeats this every minute; see the note there).
+for pid in $(pgrep -x pipewire 2>/dev/null); do
+	for tid in $(ps -L -o tid=,cls=,comm= -p "$pid" 2>/dev/null | awk '$3 ~ /^data-loop/ && $2 != "FF" {print $1}'); do
+		sudo -n chrt -f -p 83 "$tid" >/dev/null 2>&1 || true
+	done
+done
 exit 0
